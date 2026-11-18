@@ -13,6 +13,7 @@
  * each entry point is one indirect call into the chosen back end. */
 #ifndef __APPLE__
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "display.h"
 #include "gpu_d3d11.h"
@@ -36,6 +37,8 @@ static const GfxBackend D3D11 = {
     .draw_logging = d3d11_draw_logging,
     .status_lines = d3d11_status_lines,
     .closing = d3d11_closing,
+    .prepare_fighter = d3d11_prepare_fighter_begin,
+    .prepare_fighter_end = d3d11_prepare_fighter_end,
     .lock_owner = d3d11_lock_owner,
     .last_enter_thread = d3d11_last_enter_thread,
     .report_compiles = d3d11_report_compiles,
@@ -48,9 +51,35 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK choose(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     const GfxBackend *b = &D3D11;
-    if (display_renderer() == RENDERER_VULKAN) {
-        char why[600];
-        const GfxBackend *v = vk_backend_start(why, sizeof why);
+    int asked = display_renderer();
+#ifdef _WIN32
+    int automatic = asked == RENDERER_DEFAULT;   /* (auto: Vulkan on an AMD, NVIDIA or Intel card) */
+#else
+    int automatic = 0;
+#endif
+    char why[600];
+#ifdef _WIN32
+    if (automatic) {   /* (the card Direct3D 11 would take, through DXGI: on another vendor's, Vulkan is not even loaded) */
+        const char *test = getenv("SSBU_VK_AUTO_VENDOR");   /* (testing: another vendor taken for AMD's) */
+        unsigned amd = test && *test ? (unsigned)strtoul(test, NULL, 16) : 0x1002;
+        char name[128];
+        unsigned vendor = d3d11_card_vendor(name, sizeof name);
+        /* (NVIDIA too since 2026-11-11: Vulkan keeps its own pipeline cache, so a second start has every pipeline in about
+         * 2 s where Direct3D 11 compiled them again for 200-265 s whenever the driver's cache had dropped them - the owner:
+         * a recompiled game must handle its shaders as a PC game does.
+         * Intel too since 2026-11-11 (#81): Intel's Direct3D 11 driver draws the fight wrong - red light over the fighters
+         * and the stage around them, no damage numbers and no timer (Raptor Lake UHD, driver 32.0.101.7088, both checked
+         * headless on Green Hill Zone) - where its Vulkan driver draws it as NVIDIA's does. Others stay on Direct3D 11.) */
+        if (vendor != amd && vendor != 0x10de && vendor != 0x8086) {
+            if (vendor) snprintf(why, sizeof why, "%s is not an AMD, NVIDIA or Intel card, Direct3D 11 is the default for it (renderer = vulkan to draw with Vulkan)", name);
+            else snprintf(why, sizeof why, "no graphics card of AMD's, NVIDIA's or Intel's (gpu = warp, or none listed): Direct3D 11");
+            gfx_renderer_chosen(RENDERER_DEFAULT, why);
+            automatic = 0;
+        }
+    }
+#endif
+    if (asked == RENDERER_VULKAN || automatic) {
+        const GfxBackend *v = vk_backend_start(why, sizeof why, automatic);
         if (v) { b = v; gfx_renderer_chosen(RENDERER_VULKAN, NULL); }
         else gfx_renderer_chosen(RENDERER_DEFAULT, why);
     }
@@ -108,8 +137,34 @@ GfxBackend gfx_backend = {
 
 void gfx_status_lines(void) { gfx_backend.status_lines(); }
 void gfx_closing(void) { gfx_backend.closing(); }
+/* Fighter setup can run before a renderer is selected.  The active back end may
+ * replace this with its queueing implementation; the default is intentionally a
+ * no-op so the hook is harmless on unsupported renderers. */
+void gfx_prepare_fighter_begin(const char *name, unsigned slot) {
+    if (!name || !*name) return;
+    start();
+    if (gfx_backend.prepare_fighter) gfx_backend.prepare_fighter(name, slot);
+}
+void gfx_prepare_fighter_end(void) {
+    start();
+    if (gfx_backend.prepare_fighter_end) gfx_backend.prepare_fighter_end();
+}
 DWORD gfx_lock_owner(void) { return gfx_backend.lock_owner(); }
 DWORD gfx_last_enter_thread(void) { return gfx_backend.last_enter_thread(); }
 void gfx_report_compiles(void (*line)(const char *text)) { gfx_backend.report_compiles(line); }
 void *gfx_display_output(void) { return gfx_backend.display_output(); }
+/* (gpu_menu.c's software keyboard, while the game waits for it) the last frame once more, with the overlay
+ * and the menu: the back end drawing's (Vulkan's too: it was Direct3D 11's alone, so with Vulkan drawing
+ * the keyboard fell back to the Windows text box). 1, or 0 before any frame. */
+int gfx_present_again(void) {
+    if (gfx_backend.present == start_present) return 0;   /* (no back end chosen: nothing shown yet) */
+    if (gfx_backend.present == d3d11_present) return d3d11_present_again();
+    return vk_present_again();
+}
+/* (hle_fight_test.c, as a match is set up and at its fight's first frame) the Vulkan warm start's groups: the match's
+ * pipelines first, and waited for before the fight (gpu_vk.c). Nothing with Direct3D 11, whose prewarm has no groups. */
+static int vk_drawing(void) { return gfx_backend.present != start_present && gfx_backend.present != d3d11_present; }
+void gfx_match_want(unsigned long long key, int first) { if (vk_drawing()) vk_match_want(key, first); }
+void gfx_match_wait(void) { if (vk_drawing()) vk_match_wait(); }
+void gfx_warm_hint(unsigned long long key, int pick) { if (vk_drawing()) vk_warm_hint(key, pick); }
 #endif

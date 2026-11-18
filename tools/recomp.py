@@ -649,6 +649,9 @@ CODE_PATCHES = {
         (0x35BC508, 0x54003D62, [0xD503201F], "nop: b.hs (Inkling)"),
         (0x35BCF90, 0x7100231F, [0x12000B18, 0x7100231F], "and w24, w24, #7 before cmp w24, #8 (Inkling ink)"),
         (0xB0B614, 0xF9400008, [0x1400000E], "b +0x38 (Inkling c10+)"),
+        # ARCropolis writes that branch as 8 bytes, a zero word after it (the plugin's patch list has
+        # it: a udf). The branch skips it with the patches on; off, the game's own word must run there
+        (0xB0B618, 0xF9402908, [0xF9402908], "the game's own word after b +0x38 (Inkling c10+)"),
         # Inkling's ink color list (8 colors), read with the color in three places: the index wraps
         # instead of aborting past the end (not in ARCropolis' list; with Inkling c08 the match
         # stopped loading, and refilling ink stopped the game)
@@ -684,14 +687,15 @@ def local_patches(name):
 
 def plugin_patches(name):
     """[(offset, old word, new word)] the Skyline plugins write into module `name`'s code
-    (dump/skyline/patches.txt, which the runtime writes: sky_memcpy), and this PC's own (local_patches)."""
+    (dump/skyline/patches.txt, which the runtime writes: sky_memcpy; a fifth field names the plugin), and this PC's
+    own (local_patches)."""
     path = os.path.join(TREE, "dump", "skyline", "patches.txt")
     out = []
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             for line in f:
                 p = line.split()
-                if len(p) == 4 and p[0] == name:
+                if len(p) in (4, 5) and p[0] == name:
                     out.append((int(p[1], 16), int(p[2], 16), int(p[3], 16)))
     return out + local_patches(name)
 
@@ -1319,43 +1323,112 @@ def stale_files(outdir):
 def compile_dir(outdir, jobs, shown=None, steps=None):
     """Compile a module's stale files; `shown`, a progress.Build, follows them. steps: the build's
     ladder.Ladder (tools/ladder.py), else one of its own, whose report is said at the end."""
+    return not compile_dirs([outdir], jobs, shown, steps)
+
+
+def compile_dirs(outdirs, jobs, shown=None, steps=None, fatal=None, done=None):
+    """Compile the stale files of these module folders (of one build folder) in one pool, folder after
+    folder: the next folder's files start as soon as a compiler is free. (Compiled one folder at a time,
+    each waited for its slowest file: most fighters have 8 to 10 files, so most of the 12 to 16
+    compilers sat idle at the end of every folder.) Returns the folders that did not compile.
+
+    A folder whose failure ends the build (fatal(outdir); default: every one) ends it as when each
+    folder was compiled on its own: its files and the folders' before it are compiled, the folders
+    after it are not started (the files already compiling finish). done(outdir) is called (from a
+    compiler's thread) as soon as a folder's files have all compiled, at once for one with none:
+    a build stopped later keeps it. `shown` (a progress.Build) follows them as one step, the module's
+    own when there is one folder."""
     import cc
+    import threading
     ladder.settings()
-    times = ladder.Times(build_folder(outdir))
-    todo, record, keys, why, infos = plan(outdir, times)
+    fatal = fatal or (lambda d: True)
+    times = ladder.Times(build_folder(outdirs[0]))   # (the build folder's: the same for all of them)
+    todo, keys, infos, owner, records = [], {}, {}, {}, {}   # (owner: source -> its folder)
+    for d in outdirs:
+        files, records[d], k, why, i = plan(d, times)
+        if files and objcache.summary(why):
+            print(f"{os.path.basename(d)}: {objcache.summary(why)}")
+        records[d].forget([obj for _src, obj, _opt, _cost in files])
+        for src, obj, _opt, _cost in files:   # a new file, not one written through (it may be a hard link: modcache.replace_file)
+            if os.path.exists(obj):
+                os.remove(obj)
+            owner[src] = d
+        todo += files
+        keys.update(k)
+        infos.update(i)
+    stale = Counter(owner.values())
+    left = Counter(stale)   # (each folder's files not compiled yet)
+    for d in outdirs:
+        if not stale[d] and done:
+            done(d)
     if not todo:
-        return True
-    if objcache.summary(why):
-        print(f"{os.path.basename(outdir)}: {objcache.summary(why)}")
-    record.forget([obj for _src, obj, _opt, _cost in todo])
-    for _src, obj, _opt, _cost in todo:   # a new file, not one written through (it may be a hard link: modcache.replace_file)
-        if os.path.exists(obj):
-            os.remove(obj)
+        return []
+    # (SSBU_LONGEST_FIRST=1, for benchmarking: plan sorts each folder; the pool goes by all of them)
+    todo = ladder.longest_first(todo, infos) or todo
     t0 = time.time()
+    label = os.path.basename(outdirs[0]) if len(outdirs) == 1 else None   # (the bar's step: one pool for several)
     if shown:
-        shown.begin("compile", os.path.basename(outdir), [(src, cost) for src, _obj, _opt, cost in todo])
+        shown.begin("compile", label, [(src, cost) for src, _obj, _opt, cost in todo])
+    index = {d: n for n, d in enumerate(outdirs)}
+    lock, stop = threading.Lock(), [len(outdirs)]   # (stop: the first folder whose failure ended the build)
 
     def compiled(job, _level, step=None):
         # under the key of its own level even when a crash had it compiled at /O1 instead (cc.RETRY): kept until what
         # it is built from changes, rather than compiled again at every build in case the compiler no longer crashes;
         # one the ladder compiled another way, under the key of that way (ladder.check)
+        d = owner[job[0]]
         key, key_for = keys[job[1]]
-        record.compiled(job[1], key if step is None else key_for(step))
+        records[d].compiled(job[1], key if step is None else key_for(step))
+        with lock:
+            left[d] -= 1
+            last = not left[d]
+        if last and done:
+            done(d)
+
+    def failed(job):
+        d = owner[job[0]]
+        if fatal(d):
+            with lock:
+                stop[0] = min(stop[0], index[d])
     own = steps is None
     steps = steps or ladder.Ladder(progress.level_cost, "clang-cl")
     failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()),
-                               compiled=compiled, flags=cc.GAME_CFLAGS, shown=shown, infos=infos, steps=steps, times=times)
+                               compiled=compiled, flags=cc.GAME_CFLAGS, shown=shown, infos=infos, steps=steps, times=times,
+                               failed=failed, skip=lambda job: index[owner[job[0]]] > stop[0])
     if shown:
-        shown.end("compile", os.path.basename(outdir))
-    objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
-    total = sum(os.path.getsize(os.path.join(outdir, n)) for n in objs)
-    print(f"{os.path.basename(outdir)}: compiled {len(todo) - len(failures)} of {len(todo)} stale files in "
-          f"{time.time() - t0:,.0f}s; {len(objs)} objects, {total / 1048576:,.0f} MB")
-    for src, err in failures[:5]:
-        print(f"FAILED {os.path.basename(src)}:\n{err[:1500]}")
+        shown.end("compile", label)
+    bad = {}
+    for src, err in failures:
+        bad.setdefault(owner[src], []).append((src, err))
+    for d in outdirs:
+        if not stale[d] or index[d] > stop[0]:
+            continue
+        objs = [n for n in os.listdir(d) if n.endswith(".obj")]
+        total = sum(os.path.getsize(os.path.join(d, n)) for n in objs)
+        print(f"{os.path.basename(d)}: compiled {stale[d] - left[d]} of {stale[d]} stale files; "
+              f"{len(objs)} objects, {total / 1048576:,.0f} MB")
+        for src, err in bad.get(d, [])[:5]:
+            print(f"FAILED {os.path.basename(src)}:\n{err[:1500]}")
+    if stop[0] < len(outdirs) - 1:
+        print(f"{os.path.basename(outdirs[stop[0]])} did not compile: the modules after it were not compiled")
+    print(f"compiled {len(todo) - sum(left.values())} of {len(todo)} stale files in {time.time() - t0:,.0f}s")
     if own:
-        steps.end(build_folder(outdir))
-    return not failures
+        steps.end(build_folder(outdirs[0]))
+    return [d for d in outdirs if d in bad]
+
+
+def main_kind_room(dirs):
+    """tools/fighter_kinds.py room of the main build folder among `dirs` (its plugin_patches.txt: the code patches
+    it was lifted with); -1 when there is none or it does not say (a folder from before the file)."""
+    import fighter_kinds
+    for d in dirs:
+        path = os.path.join(d, "plugin_patches.txt")
+        if os.path.basename(os.path.normpath(d)) != "main" or not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            rows = [tuple(int(x, 16) for x in p) for p in (line.split() for line in f) if len(p) == 3]
+        return fighter_kinds.room(rows)
+    return -1
 
 
 def link(dirs, exe, rt_dir=None, steps=None):
@@ -1418,6 +1491,11 @@ def link(dirs, exe, rt_dir=None, steps=None):
                      + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
                      + f"const u32 rt_nro_count = {len(nros)};\n")
     want(nro_table, nro_table[:-2] + ".obj", "/O1")
+    # The fighter kinds main's code has room for (tools/fighter_kinds.py room: its build folder's plugin_patches.txt,
+    # the patches it was lifted with), for the fighter registry (runtime/hle_fighter_registry.c rt_main_kind_room)
+    kind_room = os.path.join(rt_dir, "kind_room.c")
+    write_if_changed(kind_room, f"const int rt_main_kind_room = {main_kind_room(dirs):#x};\n")
+    want(kind_room, kind_room[:-2] + ".obj", "/O1", rt_flags)
     funcs, tables = os.path.join(rt_dir, game_dll.FUNCS), os.path.join(rt_dir, game_dll.TABLES)
     if GAME_DLL:   # (the program's side of the interface, and the library's, compiled as the game is)
         write_if_changed(funcs, game_dll.funcs_text(cc.RUNTIME))
@@ -1444,7 +1522,7 @@ def link(dirs, exe, rt_dir=None, steps=None):
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
-    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [check, table[:-2] + ".obj"]
+    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [check, table[:-2] + ".obj", kind_room[:-2] + ".obj"]
     if os.path.isfile(decode_src):
         objs.append(decode_obj)
     objs.append(nro_table[:-2] + ".obj")   # (last: a --game-dll build moves it into the library)
@@ -1473,6 +1551,11 @@ def link(dirs, exe, rt_dir=None, steps=None):
         if not os.path.exists(dll) or os.path.getsize(dll) != os.path.getsize(cc.SDL3_DLL) or \
                 os.path.getmtime(dll) < os.path.getmtime(cc.SDL3_DLL):
             shutil.copy2(cc.SDL3_DLL, dll)
+    # the Vulkan back end's shader translator, ssbu_glslang.dll, when deps/glslang is there (tools/glslang_lib.py)
+    if sys.platform == "win32":
+        import glslang_lib
+        if glslang_lib.have():
+            glslang_lib.build(os.path.join(os.path.dirname(os.path.abspath(exe)), glslang_lib.DLL_NAME))
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     if GAME_DLL:
         print(f"linked {len(library)} objects into {game_lib} ({os.path.getsize(game_lib) / 1048576:,.0f} MB)")
@@ -1518,7 +1601,7 @@ def check(exefs, mods=None):
 
 
 def build_all(exefs, out, jobs, compile_c=True):
-    """Every module's C first, then each module's compile, then the link: once the C is there,
+    """Every module's C first, then every module's files in one pool (compile_dirs), then the link: once the C is there,
     what is left to compile is known, and the progress bar's time left (progress.Build) can say
     how long it takes. compile_c False (--generate-only): the C only."""
     ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
@@ -1571,16 +1654,18 @@ def build_all(exefs, out, jobs, compile_c=True):
         plugins, left_out = plugin_modules(), []
         steps = ladder.Ladder(progress.level_cost, "clang-cl")   # (one pace and one report for the whole build)
         try:
-            for name in paths:
-                if not compile_dir(targets[name], min(jobs, 16), shown, steps):
-                    if name not in plugins:
-                        return False
-                    # (a mod's plugin that doesn't compile: the game is built without it, not stopped)
-                    print(f"{name}: this plugin did not compile (above): the game is built without it, so its mod's "
-                          "moves or character won't work - send the message above to WindowSmash")
-                    left_out.append(name)
-                    continue
-                modcache.write_stamp(targets[name], build_ids[name], MODULES[name], name, fps[name])
+            # every module's files in one pool; each module's stamp as soon as its files are compiled
+            names = {targets[name]: name for name in paths}
+            failed = compile_dirs(list(names), min(jobs, 16), shown, steps, fatal=lambda d: names[d] not in plugins,
+                                  done=lambda d: modcache.write_stamp(d, build_ids[names[d]], MODULES[names[d]], names[d],
+                                                                      fps[names[d]]))
+            for d in failed:
+                if names[d] not in plugins:
+                    return False
+                # (a mod's plugin that doesn't compile: the game is built without it, not stopped)
+                print(f"{names[d]}: this plugin did not compile (above): the game is built without it, so its mod's "
+                      "moves or character won't work - send the message above to WindowSmash")
+                left_out.append(names[d])
             shown.begin("link")
             ok = link([t for n, t in targets.items() if n not in left_out], exe, steps=steps)
             shown.end("link")

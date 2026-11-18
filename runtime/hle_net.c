@@ -17,6 +17,8 @@
 
 #include "host.h"
 #include "net.h"
+#include "net_discord.h"
+#include "net_eos.h"
 #include "online.h"
 #include "input_seq.h"
 
@@ -57,7 +59,7 @@ HLE(_ZN2nn4nifm20CancelNetworkRequestEv) { (void)c; }
 HLE(_ZN2nn4nifm31HandleNetworkRequestErrorResultEv) { c->x[0] = network_up() ? 0 : R_UNAVAILABLE; }
 HLE(_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_) {   /* address, mask, gateway, two DNS servers */
     if (!network_up()) { c->x[0] = R_UNAVAILABLE; return; }
-    u32 v[5] = {net_local_ip(), NET_MASK, NET_GATEWAY, NET_GATEWAY, 0};
+    u32 v[5] = {net_local_ip(), NET_MASK, net_gateway_ip(), net_gateway_ip(), 0};
     for (int i = 0; i < 5; i++) if (c->x[i]) st32(c->x[i], _byteswap_ulong(v[i]));
     if (net_log()) fprintf(stderr, "[net] nifm: address %u.%u.%u.%u\n", v[0] >> 24, v[0] >> 16 & 255, v[0] >> 8 & 255, v[0] & 255);
     c->x[0] = 0;
@@ -176,6 +178,26 @@ static void ldn_state_to(int state) {   /* (lock held) */
 }
 
 static void ldn_send(u32 to, int type, const void *payload, u32 len) {
+    if (net_backend) {
+        /* Translate game operations, not our private L/LM wire format. Lock held. */
+        if (type == LM_JOIN && len >= 50) {
+            u8 node[0x40] = {0}; put_u32(node,net_local_ip()); make_mac(node+4,net_local_ip()); node[0xB]=1;
+            memcpy(node+0xC,(const u8 *)payload+16,32); memcpy(node+0x2E,(const u8 *)payload+48,2);
+            net_backend->ldn_send(to,YLDN_CONNECT,node,sizeof node);
+        } else if (type == LM_ADVERTISE || type == LM_GONE) {
+            for (int i=1;i<8;i++) if (L.net[NODE(i)+0xB])
+                net_backend->ldn_send(get_u32(L.net+NODE(i)),type==LM_GONE?YLDN_DESTROY:YLDN_SYNC,
+                                      type==LM_GONE?NULL:L.net,type==LM_GONE?0:NI_SIZE);
+        } else if (type == LM_ACCEPT) net_backend->ldn_send(to,YLDN_SYNC,payload,len);
+        else if (type == LM_REJECT || type == LM_KICK) net_backend->ldn_send(to,YLDN_DESTROY,NULL,0);
+        else if (type == LM_LEAVE) {
+            for (int i=1;i<8;i++) if (get_u32(L.net+NODE(i))==net_local_ip()) {
+                net_backend->ldn_send(to,YLDN_DISCONNECT,L.net+NODE(i),0x40); break;
+            }
+        }
+        return; /* LM_KEEP is native-only; ENet membership tracks yuzu room liveness. */
+    }
+
     u8 buf[4 + NI_SIZE + 4];
     if (len > sizeof buf - 4) return;
     buf[0] = 'L'; buf[1] = (u8)type; buf[2] = buf[3] = 0;
@@ -193,7 +215,7 @@ static void drop_node(int i) {   /* (host, lock held) */
     if (net_log()) fprintf(stderr, "[net] ldn: %.32s left the network\n", (const char *)L.net + NODE(i) + 0xC);
     memset(L.net + NODE(i), 0, 0x40);
     L.net[NI_NODE_COUNT]--;
-    ldn_send(NET_BROADCAST, LM_ADVERTISE, L.net, NI_SIZE);
+    ldn_send(net_broadcast_ip(), LM_ADVERTISE, L.net, NI_SIZE);
     ldn_signal();
 }
 
@@ -213,8 +235,13 @@ static DWORD WINAPI ldn_agent(LPVOID unused) {   /* advertising, keeping in touc
         AcquireSRWLockExclusive(&L.lock);
         int tick = t - last >= 1000;
         if (tick) last = t;
-        if (L.state == LS_AP_CREATED) {
-            if (tick) ldn_send(NET_BROADCAST, LM_ADVERTISE, L.net, NI_SIZE);
+        if (net_backend) {
+            if (L.state==LS_AP_CREATED) {
+                if (!net_local_ip()) { memset(L.net,0,sizeof L.net); ldn_state_to(LS_AP); }
+                else for (int i=1;i<8;i++) if(L.net[NODE(i)+0xB] && !net_backend->has_peer(get_u32(L.net+NODE(i)))) drop_node(i);
+            } else if (L.state==LS_CONNECTED && !net_backend->has_peer(get_u32(L.net+NODE(0)))) lost_network(DR_SIGNAL_LOST);
+        } else if (L.state == LS_AP_CREATED) {
+            if (tick) ldn_send(net_broadcast_ip(), LM_ADVERTISE, L.net, NI_SIZE);
             if (tick) test_room_save();
             for (int i = 1; i < 8; i++)
                 if (L.net[NODE(i) + 0xB] && t - L.node_heard[i] > 6000) drop_node(i);
@@ -222,7 +249,10 @@ static DWORD WINAPI ldn_agent(LPVOID unused) {   /* advertising, keeping in touc
             if (tick) ldn_send(get_u32(L.net + NODE(0)), LM_KEEP, L.net + NI_SESSION, 16);
             if (t - L.host_heard > 6000) lost_network(DR_SIGNAL_LOST);
         }
+        int in_room = L.state == LS_AP_CREATED || L.state == LS_CONNECTED, players = L.net[NI_NODE_COUNT], most = L.net[NI_NODE_MAX];
+        u32 host_ip = get_u32(L.net + NODE(0));
         ReleaseSRWLockExclusive(&L.lock);
+        if (tick) discord_note_room(in_room, players, most, in_room ? host_ip : 0);   /* (Discord's Rich Presence: net_discord.c) */
     }
 }
 
@@ -271,11 +301,12 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
                     memcpy(nd + 0x2E, m + 48, 2);
                     L.net[NI_NODE_COUNT]++;
                     if (net_log()) fprintf(stderr, "[net] ldn: %.32s joined as node %d\n", (const char *)nd + 0xC, i);
+                    input_seq_mark("ldn:station-joined");   /* (SSBU_SEQ: a test's room host waits for it) */
                 }
         if (node < 0) { u8 why = 1; ldn_send(from, LM_REJECT, &why, 1); break; }
         L.node_heard[node] = t;
         ldn_send(from, LM_ACCEPT, L.net, NI_SIZE);
-        ldn_send(NET_BROADCAST, LM_ADVERTISE, L.net, NI_SIZE);
+        ldn_send(net_broadcast_ip(), LM_ADVERTISE, L.net, NI_SIZE);
         ldn_signal();
         break;
     }
@@ -305,6 +336,81 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
         break;
     }
     ReleaseSRWLockExclusive(&L.lock);
+}
+
+static void backend_socket_reset(void);
+
+/* Client backend's typed LDN events. NetworkInfo uses the guest's little-endian layout. */
+static int yuzu_network_valid(u32 from,const u8 *n,u32 len) {
+    if(len!=NI_SIZE || get_u32(n+NODE(0))!=from || n[NI_SSID_LEN]>32 || get_u16(n+NI_ADV_SIZE)>0x180 ||
+       !n[NI_NODE_MAX] || n[NI_NODE_MAX]>8 || !n[NI_NODE_COUNT] || n[NI_NODE_COUNT]>n[NI_NODE_MAX]) return 0;
+    int count=0;
+    for(int i=0;i<8;i++) if(n[NODE(i)+0xB]) {
+        if(!get_u32(n+NODE(i)) || n[NODE(i)+0xA]!=i) return 0;
+        for(int j=0;j<i;j++) if(n[NODE(j)+0xB] && get_u32(n+NODE(j))==get_u32(n+NODE(i))) return 0;
+        count++;
+    }
+    return n[NODE(0)+0xB] && count==n[NI_NODE_COUNT];
+}
+static void ldn_backend_receive(u32 from,unsigned type,const void *data,u32 len) {
+    const u8 *p=data;
+    if(type==YLDN_SCAN_RESP || type==YLDN_SYNC) {
+        if(!yuzu_network_valid(from,p,len)) {
+            static volatile LONG invalid_networks;
+            if(net_log() && InterlockedIncrement(&invalid_networks)<=16)
+                fprintf(stderr,"[yuzu] ldn rejected %s from=%08x: invalid NetworkInfo\n",type==YLDN_SYNC?"SyncNetwork":"ScanResp",from);
+            return;
+        }
+        u8 message[4+NI_SIZE]={'L',LM_ADVERTISE,0,0}; memcpy(message+4,p,NI_SIZE);
+        AcquireSRWLockShared(&L.lock);
+        if(type==YLDN_SYNC && net_log()) {
+            static volatile LONG sync_logs;
+            if(InterlockedIncrement(&sync_logs)<=128)
+                fprintf(stderr,"[yuzu] ldn SyncNetwork state=%d expected_host=%08x from=%08x pending=%d session_match=%d\n",
+                        L.state,L.join_host,from,!L.join_answer,!memcmp(p+NI_SESSION,L.join_session,16));
+        }
+        if(type==YLDN_SYNC && L.join_host==from && !L.join_answer) message[1]=LM_ACCEPT;
+        ReleaseSRWLockShared(&L.lock);
+        ldn_receive(from,message,sizeof message); return;
+    }
+    AcquireSRWLockExclusive(&L.lock);
+    static volatile LONG control_logs;
+    if(type>=YLDN_CONNECT && type<=YLDN_DESTROY && net_log() && InterlockedIncrement(&control_logs)<=128)
+        fprintf(stderr,"[yuzu] ldn control type=%u from=%08x state=%d bytes=%u node_ip=%08x policy=%u nodes=%u/%u\n",
+                type,from,L.state,len,len>=4?get_u32(p):0,L.net[NI_POLICY],L.net[NI_NODE_COUNT],L.net[NI_NODE_MAX]);
+    switch(type) {
+    case YLDN_RESET:
+        memset(L.seen,0,sizeof L.seen);
+        if(L.join_host) { L.join_answer=-1; WakeAllConditionVariable(&L.changed); }
+        if(L.state==LS_CONNECTED) lost_network(DR_SIGNAL_LOST);
+        else if(L.state==LS_AP_CREATED) { memset(L.net,0,sizeof L.net); ldn_state_to(LS_AP); }
+        break;
+    case YLDN_SCAN:
+        if(L.state==LS_AP_CREATED) net_backend->ldn_send(from,YLDN_SCAN_RESP,L.net,NI_SIZE);
+        break;
+    case YLDN_CONNECT: {
+        if(L.state!=LS_AP_CREATED || len!=0x40 || get_u32(p)!=from) break;
+        int node=node_of(from);
+        if(node<0 && L.net[NI_POLICY]!=1 && L.net[NI_NODE_COUNT]<L.net[NI_NODE_MAX])
+            for(int i=1;i<8;i++) if(!L.net[NODE(i)+0xB]) { node=i; break; }
+        if(node<=0) { net_backend->ldn_send(from,YLDN_DESTROY,NULL,0); break; }
+        if(!L.net[NODE(node)+0xB]) { L.net[NI_NODE_COUNT]++; input_seq_mark("ldn:station-joined"); }   /* (SSBU_SEQ: as LM_JOIN's) */
+        memcpy(L.net+NODE(node),p,0x40); L.net[NODE(node)+0xA]=(u8)node; L.net[NODE(node)+0xB]=1;
+        L.node_heard[node]=now_ms_(); ldn_send(net_broadcast_ip(),LM_ADVERTISE,L.net,NI_SIZE); ldn_signal();
+        break;
+    }
+    case YLDN_DISCONNECT: {
+        int node=L.state==LS_AP_CREATED?node_of(from):-1;
+        if(node>0 && len==0x40 && get_u32(p)==from && !memcmp(p+4,L.net+NODE(node)+4,6)) drop_node(node);
+        break;
+    }
+    case YLDN_DESTROY:
+        if(L.join_host==from && !L.join_answer) { L.join_answer=-1; WakeAllConditionVariable(&L.changed); }
+        if(L.state==LS_CONNECTED && get_u32(L.net+NODE(0))==from) lost_network(DR_DESTROYED_BY_USER);
+        break;
+    }
+    ReleaseSRWLockExclusive(&L.lock);
+    if(type==YLDN_RESET) backend_socket_reset();
 }
 
 /* (net_relay.c) A room in the online lobby's list asked for as seq: the list replaces the
@@ -340,6 +446,7 @@ void ldn_list_end(u32 seq) {
 
 static void rooms_install(void);   /* (below: the Rooms List's 10-room cap) */
 HLE(_ZN2nn3ldn10InitializeEv) { LDN_TRACE;
+    net_backend_ldn_sink=ldn_backend_receive;
     rooms_install();
     if (!net_configured() || net_unreachable()) { c->x[0] = R_UNAVAILABLE; return; }   /* (offline, as without netplay) */
     AcquireSRWLockExclusive(&L.lock);
@@ -350,7 +457,7 @@ HLE(_ZN2nn3ldn10InitializeEv) { LDN_TRACE;
 }
 HLE(_ZN2nn3ldn8FinalizeEv) { LDN_TRACE;
     AcquireSRWLockExclusive(&L.lock);
-    if (L.state == LS_AP_CREATED) ldn_send(NET_BROADCAST, LM_GONE, L.net + NI_SESSION, 16);
+    if (L.state == LS_AP_CREATED) ldn_send(net_broadcast_ip(), LM_GONE, L.net + NI_SESSION, 16);
     if (L.state == LS_CONNECTED) ldn_send(get_u32(L.net + NODE(0)), LM_LEAVE, L.net + NI_SESSION, 16);
     L.state = LS_NONE;
     ReleaseSRWLockExclusive(&L.lock);
@@ -383,7 +490,7 @@ HLE(_ZN2nn3ldn15OpenAccessPointEv) { LDN_TRACE;
 }
 HLE(_ZN2nn3ldn16CloseAccessPointEv) { LDN_TRACE;
     AcquireSRWLockExclusive(&L.lock);
-    if (L.state == LS_AP_CREATED) ldn_send(NET_BROADCAST, LM_GONE, L.net + NI_SESSION, 16);
+    if (L.state == LS_AP_CREATED) ldn_send(net_broadcast_ip(), LM_GONE, L.net + NI_SESSION, 16);
     if (L.state == LS_AP || L.state == LS_AP_CREATED) ldn_state_to(LS_INITIALIZED);
     ReleaseSRWLockExclusive(&L.lock);
     c->x[0] = 0;
@@ -419,8 +526,9 @@ static void create_network(Cpu *c, u64 config, u64 security, u64 secparam, u64 u
     memcpy(host + 0xC, P(void, user), 32);
     memcpy(host + 0x2E, P(void, config + 0x14), 2);
     ldn_state_to(LS_AP_CREATED);
-    ldn_send(NET_BROADCAST, LM_ADVERTISE, n, NI_SIZE);
+    ldn_send(net_broadcast_ip(), LM_ADVERTISE, n, NI_SIZE);
     if (net_log()) fprintf(stderr, "[net] ldn: network created by %.32s (%u players at most)\n", (const char *)host + 0xC, n[NI_NODE_MAX]);
+    input_seq_mark("ldn:created");
     ReleaseSRWLockExclusive(&L.lock);
     c->x[0] = 0;
 }
@@ -432,7 +540,7 @@ HLE(_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfi
 }
 HLE(_ZN2nn3ldn14DestroyNetworkEv) { LDN_TRACE;
     AcquireSRWLockExclusive(&L.lock);
-    if (L.state == LS_AP_CREATED) { ldn_send(NET_BROADCAST, LM_GONE, L.net + NI_SESSION, 16); ldn_state_to(LS_AP); }
+    if (L.state == LS_AP_CREATED) { ldn_send(net_broadcast_ip(), LM_GONE, L.net + NI_SESSION, 16); ldn_state_to(LS_AP); }
     ReleaseSRWLockExclusive(&L.lock);
     c->x[0] = 0;
 }
@@ -504,7 +612,7 @@ static void rooms_browse(Cpu *c) {
     rt_call(c, rooms_browse_original);
 }
 static void rooms_install(void) {
-    static volatile long done;
+    static volatile LONG done;
     if (InterlockedExchange(&done, 1)) return;
     rooms_browse_original = rt_hook_function(ROOMS_BROWSE, rt_native(rooms_browse, "local wireless rooms list"));
     if (!rooms_browse_original) fprintf(stderr, "[net] ldn: rooms list hook missed: 10 rooms at most\n");
@@ -514,7 +622,11 @@ static void rooms_install(void) {
  * 2 session id, 4 network type, 0x10 SSID, 0x20 scene id). */
 static void scan(Cpu *c, u64 out, u64 count_p, i32 room, u64 filter) {
     u32 flags = ld32(filter + 0x5C);
-    if (net_lobby()) {   /* online: the lobby lists the rooms - wait a moment for its list, as a real scan listens a while */
+    if (net_backend) {
+        AcquireSRWLockExclusive(&L.lock); memset(L.seen,0,sizeof L.seen); ReleaseSRWLockExclusive(&L.lock);
+        net_backend->ldn_send(net_broadcast_ip(),YLDN_SCAN,NULL,0);
+        Sleep(1000); /* yuzu's request/response scan, with no native lobby LIST_END */
+    } else if (net_lobby()) {   /* online: the lobby lists the rooms - wait a moment for its list, as a real scan listens a while */
         AcquireSRWLockExclusive(&L.lock);
         u32 seq = ++L.list_asked;
         ReleaseSRWLockExclusive(&L.lock);
@@ -527,10 +639,15 @@ static void scan(Cpu *c, u64 out, u64 count_p, i32 room, u64 filter) {
     }
     u64 t = now_ms_();
     i32 found = 0;
+    /* (the room picked in F1's browser or by a Discord "Join", net_rooms_pick, first: over EOS the hub's rooms answer in
+     * any order and nothing else puts it there; a lobby's LIST already has it first) */
+    u32 picked = net_backend ? net_rooms_picked() : 0;
     AcquireSRWLockShared(&L.lock);
+    for (int pass = picked ? 0 : 1; pass < 2; pass++)
     for (int i = 0; i < SEEN_NETWORKS && found < room; i++) {
         const u8 *n = L.seen[i].info;
         if (!L.seen[i].at || t - L.seen[i].at > 3500) continue;
+        if (picked && (get_u32(n + NODE(0)) == picked) != (pass == 0)) continue;
         if (L.state == LS_AP_CREATED && !memcmp(n + NI_SESSION, L.net + NI_SESSION, 16)) continue;
         if ((flags & 1) && memcmp(n + NI_LCID, P(void, filter), 8)) continue;
         if ((flags & 2) && memcmp(n + NI_SESSION, P(void, filter + 0x10), 16)) continue;
@@ -571,8 +688,11 @@ static void join(Cpu *c, const u8 *session, u64 user, u16 version) {
     L.join_answer = 0;
     L.join_host = host;
     memcpy(L.join_session, session, 16);
+    if(net_backend && net_log()) fprintf(stderr,"[yuzu] ldn join requested host=%08x local=%08x version=%u\n",host,net_local_ip(),version);
     for (int tries = 0; tries < 5 && !L.join_answer; tries++) {
-        ldn_send(host, LM_JOIN, ask, sizeof ask);
+        /* The yuzu room channel is reliable. Repeating Connect can add duplicate
+         * stations in legacy peers; native UDP still retries once a second. */
+        if (!net_backend || !tries) ldn_send(host, LM_JOIN, ask, sizeof ask);
         u64 until = now_ms_() + 1000;
         while (!L.join_answer && now_ms_() < until) SleepConditionVariableSRW(&L.changed, &L.lock, (DWORD)(until - now_ms_()), 0);
     }
@@ -587,6 +707,7 @@ static void join(Cpu *c, const u8 *session, u64 user, u16 version) {
     L.join_answer = 0;
     L.join_host = 0;
     ReleaseSRWLockExclusive(&L.lock);
+    if (accepted) input_seq_mark("ldn:connected");
     c->x[0] = accepted ? 0 : R_LDN_CONNECT;
 }
 HLE(_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE) { LDN_TRACE;
@@ -655,7 +776,7 @@ HLE(_ZN2nn3ldn16SetAdvertiseDataEPKvm) { LDN_TRACE;
     put_u16(L.net + NI_ADV_SIZE, (u16)size);
     memset(L.net + NI_ADV, 0, 0x180);
     if (size) memcpy(L.net + NI_ADV, P(void, c->x[0]), size);
-    if (L.state == LS_AP_CREATED) ldn_send(NET_BROADCAST, LM_ADVERTISE, L.net, NI_SIZE);
+    if (L.state == LS_AP_CREATED) ldn_send(net_broadcast_ip(), LM_ADVERTISE, L.net, NI_SIZE);
     ReleaseSRWLockExclusive(&L.lock);
     c->x[0] = 0;
 }
@@ -685,6 +806,8 @@ typedef struct VSock {
     u32 rcvtimeo_ms, rcvbuf, sndbuf;
     Datagram *head, *tail;
     u32 queued, queued_bytes;
+    u64 closed_n, closed_ms;   /* (rollback: open == 2, closed by the game but kept for a load: reap_closed) */
+    u64 opened_n;              /* (rollback: made after a save, a load to it closes it: the game has it no more) */
 } VSock;
 #define VSOCKS 128
 #define FD_BASE 3   /* (fds start above the standard streams' numbers) */
@@ -695,7 +818,7 @@ static CONDITION_VARIABLE activity = CONDITION_VARIABLE_INIT;   /* a datagram ar
 static u16 next_ephemeral = 49152;
 
 static VSock *sock_of(i32 fd) {
-    if (fd < FD_BASE || fd >= FD_BASE + VSOCKS || !socks[fd - FD_BASE].open) return NULL;
+    if (fd < FD_BASE || fd >= FD_BASE + VSOCKS || socks[fd - FD_BASE].open != 1) return NULL;
     return &socks[fd - FD_BASE];
 }
 
@@ -752,7 +875,7 @@ static void write_addr(u64 a, u64 alen_p, u32 ip, u16 port) {
 static int port_taken(const VSock *self, u16 port) {
     for (u32 i = 0; i < VSOCKS; i++) {
         const VSock *s = &socks[i];
-        if (s != self && s->open && s->type == self->type && s->port == port && !(s->reuse && self->reuse)) return 1;
+        if (s != self && s->open == 1 && s->type == self->type && s->port == port && !(s->reuse && self->reuse)) return 1;
     }
     return 0;
 }
@@ -765,22 +888,108 @@ static u16 ephemeral(const VSock *self) {
     return 0;
 }
 
+/* ---- rollback (SSBU_RB): datagrams through a savestate's load ----------------------------------------
+ * A load puts the game's memory back as it was at a save: the datagrams its sockets took since (Pia's, in
+ * the Online mode, which keeps a session with the other players through the fight) are forgotten by it, and
+ * the senders don't send them again. So each one taken is kept (TAKEN of them, once savestates are taken:
+ * net_rb_save), and a load puts those taken after its save back in front of their sockets' queues, to be
+ * taken again. What the game sends again after a load goes again (a repeat, which Pia drops). */
+#define TAKEN 4096
+static struct { u64 seq; int slot; u16 port; Datagram *d; } taken[TAKEN];
+static u64 taken_n;    /* (datagrams taken so far, while kept) */
+static int rb_keep;
+static long long rb_put_back;
+static void keep_taken(int slot, u16 port, Datagram *d) {
+    unsigned k = (unsigned)(taken_n % TAKEN);
+    free(taken[k].d);
+    taken[k].seq = taken_n++; taken[k].slot = slot; taken[k].port = port; taken[k].d = d;
+}
+/* A datagram socket the game closes while savestates are taken is kept a while, closed for the game (open 2): a load
+ * to before the close gives it back as it was, its port and what came for it meanwhile (Pia closed its socket in a
+ * rematch with rollback, a load went back before that, and Pia's next send found no socket: the session, and the
+ * match, ended on both games). Gone for good RB_CLOSE_MS after (no load goes back that far). */
+#define RB_CLOSE_MS 3000
+static void drop_queue(VSock *s);
+static u64 closed_n, opened_n;
+static void reap_closed(int all) {   /* (the lock held) */
+    u64 now = now_ms_();
+    for (u32 i = 0; i < VSOCKS; i++)
+        if (socks[i].open == 2 && (all || now - socks[i].closed_ms > RB_CLOSE_MS)) { drop_queue(&socks[i]); memset(&socks[i], 0, sizeof socks[i]); }
+}
+typedef struct NetRb { u64 taken, closed, opened; OnlineRb online; } NetRb;
+void *net_rb_save(void) {
+    NetRb *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    AcquireSRWLockExclusive(&lock);
+    rb_keep = 1; r->taken = taken_n; r->closed = closed_n; r->opened = opened_n;
+    reap_closed(0);
+    ReleaseSRWLockExclusive(&lock);
+    online_rb_save(&r->online);
+    return r;
+}
+void net_rb_load(const void *p) {
+    const NetRb *r = p;
+    if (!r) return;
+    int any = 0;
+    AcquireSRWLockExclusive(&lock);
+    if (taken_n - r->taken > TAKEN) fprintf(stderr, "[net] a load %llu datagrams back: more than kept, the older not taken again\n", (unsigned long long)(taken_n - r->taken));
+    while (taken_n > r->taken && taken_n - r->taken <= TAKEN) {   /* (newest first, each in front: the oldest ends first) */
+        unsigned k = (unsigned)(--taken_n % TAKEN);
+        Datagram *d = taken[k].d;
+        taken[k].d = NULL;
+        VSock *s = &socks[taken[k].slot];
+        if (!d) continue;
+        if (!s->open || s->port != taken[k].port) { free(d); continue; }
+        d->next = s->head; s->head = d;
+        if (!s->tail) s->tail = d;
+        s->queued++; s->queued_bytes += d->len;
+        rb_put_back++; any = 1;
+    }
+    for (u32 i = 0; i < VSOCKS; i++)   /* (made since the save: gone, as for the game then) */
+        if (socks[i].open && socks[i].opened_n > r->opened && socks[i].type == SOCK_DGRAM_) {
+            fprintf(stderr, "[net] a load: socket %u, made by the game since the save, closed\n", i + FD_BASE);
+            drop_queue(&socks[i]); memset(&socks[i], 0, sizeof socks[i]); any = 1;
+        }
+    for (u32 i = 0; i < VSOCKS; i++)   /* (closed since the save: open again, as the game had it then) */
+        if (socks[i].open == 2 && socks[i].closed_n > r->closed) {
+            socks[i].open = 1; any = 1;
+            fprintf(stderr, "[net] a load: socket %u, closed by the game since the save, open again\n", i + FD_BASE);
+        }
+    ReleaseSRWLockExclusive(&lock);
+    online_rb_load(&r->online);
+    if (any) WakeAllConditionVariable(&activity);
+}
+void net_rb_counts_report(void) {
+    long long back, left_out, differ;
+    online_rb_counts(&back, &left_out, &differ);
+    fprintf(stderr, "[net] rollback: %lld datagrams taken again after loads; NEX streams: %lld bytes read again, %lld sent again left out, %lld times the game sent other bytes\n",
+            rb_put_back, back, left_out, differ);
+}
+
 static void drop_queue(VSock *s) {
     while (s->head) { Datagram *d = s->head; s->head = d->next; free(d); }
     s->tail = NULL;
     s->queued = s->queued_bytes = 0;
 }
 
+/* Never carry guest datagrams from a former room connection into a new one. */
+static void backend_socket_reset(void) {
+    AcquireSRWLockExclusive(&lock);
+    for (int i=0;i<VSOCKS;i++) drop_queue(&socks[i]);
+    ReleaseSRWLockExclusive(&lock);
+    WakeAllConditionVariable(&activity);
+}
+
 void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
-    if (dst_port == LDN_PORT) {   /* (local wireless's own messages: from local wireless alone) */
+    if (!net_backend && dst_port == LDN_PORT) {   /* (local wireless's own messages: from local wireless alone) */
         if (src_port == LDN_PORT) ldn_receive(src_ip, data, len);
         return;
     }
-    int broadcast = dst_ip == ANY_BROADCAST || dst_ip == NET_BROADCAST, delivered = 0;
+    int broadcast = dst_ip == ANY_BROADCAST || dst_ip == net_broadcast_ip(), delivered = 0;
     AcquireSRWLockExclusive(&lock);
     for (u32 i = 0; i < VSOCKS; i++) {
         VSock *s = &socks[i];
-        if (!s->open || s->type != SOCK_DGRAM_ || s->port != dst_port || s->shut_rd) continue;
+        if (!s->open || s->type != SOCK_DGRAM_ || s->port != dst_port || s->shut_rd) continue;   /* (one closed by the game but kept for a load, open 2, gets a copy: for the game as it was before its close) */
         if (!broadcast && s->ip && s->ip != dst_ip && s->ip != LOOPBACK) continue;   /* bound to another address */
         if (s->peer_port && (s->peer_ip != src_ip || s->peer_port != src_port)) continue;   /* connected elsewhere */
         if (s->queued >= 1024 || s->queued_bytes + len > QUEUE_BYTES) continue;   /* (full: dropped, as a LAN would) */
@@ -793,10 +1002,14 @@ void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const voi
         s->queued++;
         s->queued_bytes += len;
         delivered = 1;
-        if (!broadcast && !s->reuse) break;
+        if (!broadcast && !s->reuse && s->open == 1) break;
     }
     ReleaseSRWLockExclusive(&lock);
     if (delivered) WakeAllConditionVariable(&activity);
+    static volatile LONG backend_deliveries;
+    if(net_backend && net_log() && InterlockedIncrement(&backend_deliveries)<=128)
+        fprintf(stderr,"[yuzu] udp socket delivery src=%08x:%u dst=%08x:%u bytes=%u result=%s\n",
+                src_ip,src_port,dst_ip,dst_port,len,delivered?"queued":"no-eligible-socket-or-full");
 }
 
 static void do_socket(Cpu *c, i32 domain, i32 type, i32 proto) {
@@ -809,6 +1022,7 @@ static void do_socket(Cpu *c, i32 domain, i32 type, i32 proto) {
         if (!socks[i].open) {
             memset(&socks[i], 0, sizeof socks[i]);
             socks[i].open = 1;
+            socks[i].opened_n = ++opened_n;
             socks[i].type = base;
             socks[i].nonblock = (type & (SOCK_NONBLOCK_ | O_NONBLOCK_)) != 0;
             socks[i].rcvbuf = socks[i].sndbuf = 0x10000;
@@ -827,7 +1041,7 @@ static void do_bind(Cpu *c, i32 fd, u64 addr, u32 len) {
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
     int err = !s ? E_BADF : !read_addr(addr, len, &ip, &port) ? E_INVAL : 0;
-    if (!err && ip && ip != LOOPBACK && ip != net_local_ip() && ip != ANY_BROADCAST && ip != NET_BROADCAST) err = E_ADDRNOTAVAIL;
+    if (!err && ip && ip != LOOPBACK && ip != net_local_ip() && ip != ANY_BROADCAST && ip != net_broadcast_ip()) err = E_ADDRNOTAVAIL;
     if (!err && port && port_taken(s, port)) err = E_ADDRINUSE;
     if (!err && !port && !(port = ephemeral(s))) err = E_ADDRINUSE;
     if (!err) { s->ip = ip; s->port = port; }
@@ -883,8 +1097,8 @@ static void do_sendto(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u32
     u16 sport = s && !err ? s->port : 0;
     ReleaseSRWLockExclusive(&lock);
     u32 me = net_local_ip();
-    int broadcast = dst == ANY_BROADCAST || dst == NET_BROADCAST;
-    if (!err && !broadcast && dst != LOOPBACK && dst != me && ((dst & NET_MASK) != NET_SUBNET || !me)) err = E_NETUNREACH;
+    int broadcast = dst == ANY_BROADCAST || dst == net_broadcast_ip();
+    if (!err && !broadcast && dst != LOOPBACK && dst != me && (!net_address_allowed(dst) || !me)) err = E_NETUNREACH;
     if (net_log() > 1 || (net_log() && err))
         fprintf(stderr, "[net] sendto(%d, %llu bytes, %s:%u) from port %u%s%d\n", fd, len, ip_text(dst, t), dport, sport, err ? ": error " : " ", err);
     if (err) { fail(c, err); return; }
@@ -892,14 +1106,28 @@ static void do_sendto(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u32
     if (dst == LOOPBACK) vsock_deliver(LOOPBACK, sport, LOOPBACK, dport, data, (u32)len);
     else {
         if (dst == me || broadcast) vsock_deliver(me, sport, dst, dport, data, (u32)len);   /* (a broadcast reaches this player's sockets too) */
-        if (dst != me) net_send(me, sport, broadcast ? NET_BROADCAST : dst, dport, data, (u32)len);
+        if ((!net_backend || net_backend == &net_eos_backend) && dst != me && !broadcast) net_note_peer(dst);   /* (native Online rollback's match players: the lobby's network or EOS's) */
+        if (dst != me && (broadcast || !online_nex_datagram(me, sport, dst, dport, data, (u32)len)))   /* (the game server in the game's) */
+            net_send(me, sport, broadcast ? net_broadcast_ip() : dst, dport, data, (u32)len);
     }
     c->x[0] = len;
 }
 
 /* Wait for the activity condition until the deadline (ms since boot; ~0: for ever). Returns
  * 0 once it has passed. Called holding the lock. */
-static int wait_activity(u64 deadline) {
+/* (rollback, SSBU_RB) A guest thread waiting here parks during a savestate's hold as in the kernel's own waits
+ * (kernel_rb_park_guest): Online mode's NEX thread waits in poll() nearly always, and a hold that waited for its
+ * poll's timeout took ~95 ms a save. Its callers look at their wait again after any return. */
+int kernel_rb_park_guest(void *kthread);
+extern void (*kernel_rb_wake_hook)(void);
+static int wait_activity(Cpu *c, u64 deadline) {
+    if (!kernel_rb_wake_hook) kernel_rb_wake_hook = net_wake;
+    if (c && kernel_rb_park_guest(NULL)) {   /* (a hold now: park, without the lock) */
+        ReleaseSRWLockExclusive(&lock);
+        kernel_rb_park_guest(c->thread);
+        AcquireSRWLockExclusive(&lock);
+        return 1;
+    }
     DWORD ms = INFINITE;
     if (deadline != ~0ull) {
         u64 now = rt_now_ns() / 1000000;
@@ -910,7 +1138,9 @@ static int wait_activity(u64 deadline) {
     return 1;
 }
 
+void rb_guest_writing(void *p, u64 n);   /* (hle_rb_state.c) */
 static void do_recvfrom(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u64 alen_p) {
+    rb_guest_writing(P(void, buf), len);
     if (is_stream(fd)) {
         AcquireSRWLockShared(&lock);
         VSock *ss = sock_of(fd);
@@ -935,7 +1165,7 @@ static void do_recvfrom(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u
         if (s->type != SOCK_DGRAM_ && !s->peer_port && !s->port) { err = E_NOTCONN; break; }
         if (s->shut_rd) { ReleaseSRWLockExclusive(&lock); c->x[0] = 0; return; }
         if (s->nonblock || (flags & MSG_DONTWAIT_)) { err = E_AGAIN; break; }
-        if (!wait_activity(deadline)) { err = E_AGAIN; break; }
+        if (!wait_activity(c, deadline)) { err = E_AGAIN; break; }
     }
     if (err) { ReleaseSRWLockExclusive(&lock); fail(c, err); return; }
     Datagram *d = s->head;
@@ -948,7 +1178,8 @@ static void do_recvfrom(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u
         if (!s->head) s->tail = NULL;
         s->queued--;
         s->queued_bytes -= d->len;
-        free(d);
+        if (rb_keep) keep_taken((int)(s - socks), s->port, d);   /* (a load may want it taken again) */
+        else free(d);
     }
     ReleaseSRWLockExclusive(&lock);
     write_addr(addr, alen_p, ip, port);
@@ -978,7 +1209,7 @@ static void do_poll(Cpu *c, u64 fds, u64 nfds, i32 timeout) {
             st16(p + 6, revents);
             ready += revents != 0;
         }
-        if (ready || timeout == 0 || !wait_activity(deadline)) break;
+        if (ready || timeout == 0 || !wait_activity(c, deadline)) break;
     }
     ReleaseSRWLockExclusive(&lock);
     if (net_log() > 2) fprintf(stderr, "[net] poll(%llu fds, %d ms) = %u\n", nfds, timeout, ready);
@@ -1062,7 +1293,8 @@ static void do_close(Cpu *c, i32 fd) {
     if (is_stream(fd)) online_stream_close(fd);
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
-    if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
+    if (s && rb_keep && s->type == SOCK_DGRAM_) { s->open = 2; s->closed_n = ++closed_n; s->closed_ms = now_ms_(); }   /* (kept for a load: above) */
+    else if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
     ReleaseSRWLockExclusive(&lock);
     WakeAllConditionVariable(&activity);
     if (net_log()) fprintf(stderr, "[net] close(%d)%s\n", fd, s ? "" : ": not a socket");
@@ -1080,7 +1312,7 @@ static void do_accept(Cpu *c, i32 fd) {   /* no stream ever connects: wait until
     VSock *s = sock_of(fd);
     int err = !s ? E_BADF : s->nonblock ? E_AGAIN : 0;
     while (!err) {
-        wait_activity(~0ull);
+        wait_activity(c, ~0ull);
         if (!(s = sock_of(fd)) || s->shut_rd) err = E_BADF;
     }
     ReleaseSRWLockExclusive(&lock);

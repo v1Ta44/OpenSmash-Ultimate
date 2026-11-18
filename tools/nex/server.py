@@ -248,6 +248,12 @@ class NexServer:
         if ranked is not None:
             ranked.tick(now)
             ranked.flush(now, force)
+        services = getattr(self, "services", None)
+        if services is not None:
+            services.powers.flush(now, force)
+        board = getattr(self, "board", None)
+        if board is not None:
+            board.flush(now, force)
 
     def servers(self):
         return (self.auth, self.secure, self.auth_lite, self.secure_lite)
@@ -348,7 +354,8 @@ class NexServer:
             other = next((c for c in self.by_pid.values() if c.addr[0] == ip), None)
             if other is not None:
                 self.at_ip[ip] = other
-        self.info(f"{self.name(conn)} left")
+        why = getattr(conn, "why", "")
+        self.info(f"{self.name(conn)} left" + (f" ({why})" if why else ""))
         for fn in self.on_disconnect:
             fn(conn)
 
@@ -566,11 +573,15 @@ class NexServer:
 
 def make_server(send, host="10.13.0.1", state_dir=None, log=print, verbose=1):
     """The game server with every service it has."""
+    from .arenas import Arenas
+    from .board import Board
     from .matchmaking import Matchmaking
     from .ranked import Ranked
     from .services import Services
     nex = NexServer(send, host, state_dir, log, verbose)
     nex.ranked = Ranked(nex, state_dir)
     nex.matchmaking = Matchmaking(nex)
+    nex.arenas = Arenas(nex, nex.matchmaking)
     nex.services = Services(nex)
+    nex.board = Board(nex)
     return nex

@@ -17,6 +17,8 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "language.h"     /* (the save's text language) */
+#include "mod_refresh.h"
 
 #ifndef _WIN32   /* (the save journal's few calls Windows has no stand-in for in runtime/linux) */
 #include <fcntl.h>
@@ -63,8 +65,10 @@ typedef struct { u32 parent, sibling, child_dir, child_file, hash, name_len; cha
 typedef struct { u32 parent, sibling; u64 offset, size; u32 hash, name_len; char name[]; } RomFile;
 #define NONE 0xFFFFFFFFu
 
+void rb_guest_writing(void *p, u64 n);   /* (hle_rb_state.c: the rollback state map's read-only pages opened for the system's write) */
 static int pread_all(HANDLE h, u64 offset, void *buf, u64 size) {
     u8 *p = buf;
+    rb_guest_writing(buf, size);
     while (size) {
         OVERLAPPED o = {0};
         o.Offset = (DWORD)offset;
@@ -99,8 +103,44 @@ static int rom_read(u64 at, void *buf, u64 size) {
 
 static HANDLE rom_file_open(const char *path) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
-    if (h == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s", path);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* (the folder was moved or copied: romfs.cfg names its own files by their old full path. A file inside the
+         * old dump folder is looked for in this one's - "cannot find the path" after a move, 2026-11-03's report) */
+        const char *rest = NULL;
+        for (const char *s = path; (s = strstr(s, "dump")) != NULL; s += 4)
+            if ((s == path || s[-1] == '/' || s[-1] == '\\') && (s[4] == '/' || s[4] == '\\')) rest = s + 5;   /* (the last dump folder named) */
+        if (rest && !_strnicmp(rest, "modules", 7) && (rest[7] == '/' || rest[7] == '\\')) {   /* (only this folder's own dump\modules files: the game's files elsewhere are not guessed) */
+            char moved[1100];
+            snprintf(moved, sizeof moved, "%s/../%s", rt_data_dir, rest);
+            h = CreateFileA(moved, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+            if (h != INVALID_HANDLE_VALUE) fprintf(stderr, "[fs] romfs.cfg names %s, which is not there: using %s (the folder was moved)\n", path, moved);
+        }
+    }
+    if (h == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s (moved the folder to another PC? run the installer there once)", path);
     return h;
+}
+
+/* romfs.unverified.txt beside romfs.cfg (tools/update.py): 16 KB blocks of the updated RomFS whose
+ * bytes could not be confirmed against the update's hashes, one "<block> <image offset>" line each
+ * (what each holds indented below it). A player's merged base left LoupeSubstance's model files
+ * wrong there, and the game crashed at boot with nothing to say why: every crash report now
+ * carries this line (host.c). Empty when there is no such file. */
+/* (rt_romfs_warning: host.c's, which every build links - a crash report reads it) */
+
+static void rom_unverified_note(void) {
+    char path[1100], line[512];
+    snprintf(path, sizeof path, "%s/romfs.unverified.txt", rt_data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    unsigned blocks = 0;
+    while (fgets(line, sizeof line, f))
+        if (line[0] >= '0' && line[0] <= '9') blocks++;   /* (not "#" notes, nor the indented lines under a block) */
+    fclose(f);
+    if (!blocks) return;
+    snprintf(rt_romfs_warning, sizeof rt_romfs_warning,
+             "game data: %u blocks of 16 KB unconfirmed (dump/modules/romfs.unverified.txt) - the base had an update "
+             "merged in; a crash may come from them", blocks);
+    fprintf(stderr, "[fs] warning: %s\n", rt_romfs_warning);
 }
 
 /* romfs.cfg: "<file>\n<byte offset>\n" (the image in place in one file), or "layered\n<layer
@@ -137,6 +177,7 @@ static void rom_open(void) {
         rom.file = rom_file_open(path);
     }
     fclose(f);
+    rom_unverified_note();
     u64 h[10];
     if (!rom_read(0, h, sizeof h) || h[0] != 0x50) rt_fatal("%s: no RomFS image there", cfg);
     rom.dirs = malloc(h[4]);
@@ -187,8 +228,12 @@ typedef struct Handle {
     int used, kind, mode;
     u32 mount;                /* the mount's id */
     HANDLE host;              /* host file */
+    char texture_path[600];
+    int system_save;          /* the game's system save (system_data.bin): its text language is the chosen one */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
+    size_t list_cap;
+    int list_failed;
 } Handle;
 static Handle handles[512];
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
@@ -1037,7 +1082,7 @@ static int listing_host(Handle *h, const char *dir, int mode, struct Mount *m, c
         while (k < h->count && _stricmp(h->names[k], fd.cFileName)) k++;
         if (k < h->count) { h->types[k] = isdir ? DIR_ENTRY : FILE_ENTRY; h->sizes[k] = size; }
         else listing_add(h, fd.cFileName, strlen(fd.cFileName), isdir ? DIR_ENTRY : FILE_ENTRY, size);
-    } while (FindNextFileA(fh, &fd));
+    } while (!h->list_failed && FindNextFileA(fh, &fd));
     FindClose(fh);
     return 1;
 }
@@ -1050,7 +1095,7 @@ static u32 save_list(struct Mount *m, const char *rest, int mode, Handle *h) {  
     if (!tomb_hides(m, rel)) { join(path, sizeof path, m->root, rel); listing_host(h, path, mode, m, rel, 0); }
     join(path, sizeof path, m->work, rel);
     listing_host(h, path, mode, NULL, NULL, 1);
-    return 0;
+    return h->list_failed ? R_HOST_FAILURE : 0;
 }
 
 static u32 save_delete(struct Mount *m, const char *rest, int dir) {
@@ -1060,9 +1105,10 @@ static u32 save_delete(struct Mount *m, const char *rest, int dir) {
     if (!rel[0] || view(m, rel, path, sizeof path) != (dir ? 2 : 1)) return R_PATH_NOT_FOUND;
     if (dir) {   /* only an empty folder, as the host's own RemoveDirectory */
         Handle h = {0};
-        save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
+        r = save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
         i64 n = h.count;
         listing_free(&h);
+        if (r) return r;
         if (n) return R_PATH_NOT_FOUND;
     }
     join(path, sizeof path, m->work, rel);
@@ -1088,11 +1134,16 @@ void fs_mount_sd(void) {
 }
 int skyline_provides(const char *path);
 void select_screen_install(void);   /* (hle_select_screen.c) */
+#ifdef _WIN32
+void rb_map_install(void);   /* (hle_rb_map.c) */
+#else
+static void rb_map_install(void) {}
+#endif
 /* (once the RomFS is there, Skyline's plugins load, as on the console) */
 HLE(_ZN2nn2fs8MountRomEPKcPvm) {
     ready();
     u32 r = add_mount(P(char, c->x[0]), M_ROM, "", NULL);
-    if (!r) { select_screen_install(); skyline_load_plugins(c); native_mods_load(); }   /* (more select-screen tiles: hle_select_screen.c; the fighter SDK's hook.h mods: hle_native_mods.c) */
+    if (!r) { select_screen_install(); skyline_load_plugins(c); native_mods_load(); rb_map_install(); }   /* (rb_map_install: hle_rb_map.c, the rollback state map's allocator hooks) */   /* (more select-screen tiles: hle_select_screen.c; the fighter SDK's hook.h mods: hle_native_mods.c) */
     c->x[0] = r;
 }
 HLE(_ZN2nn2fs17MountCacheStorageEPKc) {
@@ -1192,6 +1243,9 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
             h.size = rom_file(f)->size;
         }
     } else if (m->kind == M_SAVE) {
+        const char *leaf = rest;
+        for (const char *s = rest; *s; s++) if (*s == '/' || *s == '\\' || *s == ':') leaf = s + 1;
+        h.system_save = !(mode & OPEN_WRITE) && !_stricmp(leaf, "system_data.bin");
         EnterCriticalSection(&jlock);   /* (held until the handle is in the table: Commit looks for writers there) */
         u32 r = save_open(m, rest, &h);
         u64 v = r ? 0 : new_handle(h);
@@ -1206,6 +1260,9 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         host_path(path, sizeof path, m, rest);
         h.host = CreateFileA(path, GENERIC_READ | (mode & OPEN_WRITE ? GENERIC_WRITE : 0), SHARE_ALL, NULL, OPEN_EXISTING, 0, NULL);
         if (h.host == INVALID_HANDLE_VALUE) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        const char *extension = strrchr(path, '.');
+        if (!(mode & OPEN_WRITE) && extension && !_stricmp(extension, ".nutexb"))
+            snprintf(h.texture_path, sizeof h.texture_path, "%s", path);
     }
     u64 v = new_handle(h);
     if (!v) { if (h.host) CloseHandle(h.host); c->x[0] = R_TOO_MANY_HANDLES; return; }
@@ -1220,6 +1277,27 @@ static u64 file_size(Handle *h) {
     return (u64)s.QuadPart;
 }
 
+/* The game keeps its text language in its system save, written once when the save is made
+ * (language.h), and shows its text in that one whatever language it is given: a save made in
+ * another language (a downloaded one) kept the game in that language (#362). When the player
+ * chose a language, the save is read with that one; the game writes it back at its next save. */
+int save_language_wanted(const char **code);   /* (hle_env.c) */
+static void system_save_language(u64 total, i64 offset, u8 *buf, u64 size) {
+    if (total != LANGUAGE_SAVE_FILE_SIZE || (u64)offset > LANGUAGE_SAVE_OFFSET || LANGUAGE_SAVE_OFFSET - (u64)offset >= size) return;
+    const char *code = NULL;
+    int want = save_language_wanted(&code);
+    u8 *at = buf + (LANGUAGE_SAVE_OFFSET - (u64)offset);
+    static volatile LONG logged;
+    if (want < 0 || *at == (u8)want) {
+        if (!InterlockedExchange(&logged, 1))
+            fprintf(stderr, "[fs] the save's text language: %u%s\n", *at, want < 0 ? " (no language chosen: the save's stays)" : ", the chosen one");
+        return;
+    }
+    if (!InterlockedExchange(&logged, 1))
+        fprintf(stderr, "[fs] the save's text language: %u; read as %d, the chosen language's (%s)\n", *at, want, code);
+    *at = (u8)want;
+}
+
 /* Read up to `size` bytes at `offset`; returns the count, or ~0 on a host error. */
 static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     u64 total = file_size(h);
@@ -1227,6 +1305,9 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
     int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
+    if (ok && h->system_save) system_save_language(total, offset, buf, size);
+    /* Costume inference reads headers, not pixels: only a full load needs a snapshot. */
+    if (ok && offset == 0 && size == total && h->texture_path[0]) mod_refresh_file_opened(h->texture_path);
     return ok ? size : ~0ull;
 }
 
@@ -1319,7 +1400,20 @@ HLE(_ZN2nn2fs15CreateDirectoryEPKc) {
     }
     char path[1024];
     host_path(path, sizeof path, m, rest);
-    c->x[0] = CreateDirectoryA(path, NULL) ? 0 : GetLastError() == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND;
+    BOOL made = CreateDirectoryA(path, NULL);
+    if (!made && (GetLastError() == ERROR_PATH_NOT_FOUND || GetLastError() == ERROR_FILE_NOT_FOUND)) {   /* (POSIX: ENOENT, runtime/linux/win32.c) */
+        /* (its parents too: Skyline's create_dir_all makes only the last folder, so a plugin that
+         * writes under sd:/atmosphere/contents/<title>/ - skyline-web's pages - counts on a console
+         * SD card having the rest; here the SD card starts empty) */
+        for (char *p = strchr(path, '\\'); p; p = strchr(p + 1, '\\')) {
+            if (p == path || p[-1] == ':' || !p[1]) continue;
+            *p = 0;
+            CreateDirectoryA(path, NULL);
+            *p = '\\';
+        }
+        made = CreateDirectoryA(path, NULL);
+    }
+    c->x[0] = made ? 0 : GetLastError() == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND;
 }
 HLE(_ZN2nn2fs15DeleteDirectoryEPKc) {
     const char *rest;
@@ -1339,18 +1433,37 @@ HLE(_ZN2nn2fs15DeleteDirectoryEPKc) {
 
 /* ---- directories ----------------------------------------------------------------- */
 static void listing_add(Handle *h, const char *name, size_t len, int type, u64 size) {
-    h->names = realloc(h->names, sizeof *h->names * (h->count + 1));
-    h->types = realloc(h->types, h->count + 1);
-    h->sizes = realloc(h->sizes, sizeof *h->sizes * (h->count + 1));
-    h->names[h->count] = malloc(len + 1);
-    memcpy(h->names[h->count], name, len);
-    h->names[h->count][len] = 0;
+    if (h->list_failed) return;
+    if ((size_t)h->count == h->list_cap) {
+        /* Large mod directories used to resize all three arrays for every entry. Grow
+         * geometrically; keep every successful allocation owned if a later one fails. */
+        if (h->list_cap > SIZE_MAX / 2 / sizeof *h->names) { h->list_failed = 1; return; }
+        size_t cap = h->list_cap ? h->list_cap * 2 : 32;
+        char **names = realloc(h->names, cap * sizeof *names);
+        if (!names) { h->list_failed = 1; return; }
+        h->names = names;
+        u8 *types = realloc(h->types, cap * sizeof *types);
+        if (!types) { h->list_failed = 1; return; }
+        h->types = types;
+        u64 *sizes = realloc(h->sizes, cap * sizeof *sizes);
+        if (!sizes) { h->list_failed = 1; return; }
+        h->sizes = sizes;
+        h->list_cap = cap;
+    }
+    if (len == SIZE_MAX) { h->list_failed = 1; return; }
+    char *copy = malloc(len + 1);
+    if (!copy) { h->list_failed = 1; return; }
+    memcpy(copy, name, len);
+    copy[len] = 0;
+    h->names[h->count] = copy;
     h->types[h->count] = (u8)type;
     h->sizes[h->count++] = size;
 }
 static void listing_free(Handle *h) {
     for (i64 i = 0; i < h->count; i++) free(h->names[i]);
     free(h->names); free(h->types); free(h->sizes);
+    h->names = NULL; h->types = NULL; h->sizes = NULL;
+    h->count = h->next = 0; h->list_cap = 0; h->list_failed = 0;
 }
 
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
@@ -1366,16 +1479,16 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         u32 d, f;
         if (!rom_lookup(rest, &d, &f) || f != NONE) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & LIST_DIRS)
-            for (u32 k = rom_dir(d)->child_dir; k != NONE; k = rom_dir(k)->sibling)
+            for (u32 k = rom_dir(d)->child_dir; k != NONE && !h.list_failed; k = rom_dir(k)->sibling)
                 listing_add(&h, rom_dir(k)->name, rom_dir(k)->name_len, DIR_ENTRY, 0);
         if (mode & LIST_FILES)
-            for (u32 k = rom_dir(d)->child_file; k != NONE; k = rom_file(k)->sibling)
+            for (u32 k = rom_dir(d)->child_file; k != NONE && !h.list_failed; k = rom_file(k)->sibling)
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
         load_mods_list();   /* (the turned-on mods only) */
         char flat[4200];
-        for (int i = 0; i < mods_count && (mode & LIST_DIRS); i++) {
+        for (int i = 0; i < mods_count && (mode & LIST_DIRS) && !h.list_failed; i++) {
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
@@ -1383,7 +1496,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         /* every turned-on mod's files as one tree: a later mod's entry over an earlier one's */
         load_mods_list();
         int found = 0;
-        for (int i = 0; i < mods_count; i++) {
+        for (int i = 0; i < mods_count && !h.list_failed; i++) {
             char path[4400];
             snprintf(path, sizeof path, "%s/../../mods/%s/%s", rt_data_dir, mods_list[i], rest + strspn(rest, "/"));
             for (char *q = path; *q; q++) if (*q == '/') *q = '\\';
@@ -1401,7 +1514,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
                 while (k < h.count && _stricmp(h.names[k], fd.cFileName)) k++;
                 if (k < h.count) { h.types[k] = dir ? DIR_ENTRY : FILE_ENTRY; h.sizes[k] = size; }
                 else listing_add(&h, fd.cFileName, strlen(fd.cFileName), dir ? DIR_ENTRY : FILE_ENTRY, size);
-            } while (FindNextFileA(fh, &fd));
+            } while (!h.list_failed && FindNextFileA(fh, &fd));
             FindClose(fh);
         }
         if (!found) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
@@ -1413,7 +1526,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
-        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
         if (!strcmp(m->name, "sd")) {   /* a mod's own copy of a file .characters provides is not shown to ARCropolis */
             for (i64 k = 0; k < h.count; ) {
                 if (h.types[k] == FILE_ENTRY && hidden_from_arcropolis(rest, h.names[k])) {
@@ -1426,6 +1539,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
             }
         }
     }
+    if (h.list_failed) { listing_free(&h); c->x[0] = R_HOST_FAILURE; return; }
     u64 v = new_handle(h);
     if (!v) { listing_free(&h); c->x[0] = R_TOO_MANY_HANDLES; return; }
     st64(c->x[0], v);

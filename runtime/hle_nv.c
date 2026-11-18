@@ -169,24 +169,26 @@ static u32 ctrl(u32 nr, u64 a, u32 request) {
         /* A value submitted work will reach: wait for the GPU thread to get there (the async
          * form too - it then has nothing to wait for). A timeout past a few seconds is taken
          * as none being meant: whatever is wrong, the game goes on rather than hanging. */
-        if (gpu_threaded() && (i32)(gpu_syncpt_max[id] - value) >= 0 && (i32)(gpu_syncpt_min[id] - value) < 0) {
+        if (gpu_threaded() && gpu_syncpt_reached(gpu_syncpt_load(&gpu_syncpt_max[id]), value) && !gpu_syncpt_reached(gpu_syncpt_read(id), value)) {
             if (!gpu_syncpt_wait(id, value, timeout && timeout < 5000 ? timeout : 5000)) {
-                if (timeout && timeout < 5000) return NV_TIMEOUT;
+                if (timeout && timeout < 5000) {
+                    return NV_TIMEOUT;
+                }
                 static int warned;
                 if (warned++ < 4) fprintf(stderr, "[nvdrv] sync point %u: still short of %u after 5 s - going on\n", id, value);
             }
-            st32(a + 12, gpu_syncpt_min[id]);
+            st32(a + 12, gpu_syncpt_read(id));
             return NV_OK;
         }
         /* The driver also advances sync points from inside its command lists, and values no
          * submission will reach are taken as reached: the GPU is modelled as finishing
          * everything instantly. */
-        if ((i32)(gpu_syncpt_max[id] - value) < 0) gpu_syncpt_max[id] = value;
-        if ((i32)(gpu_syncpt_min[id] - value) < 0) gpu_syncpt_min[id] = value;
-        st32(a + 12, gpu_syncpt_min[id]);
+        gpu_syncpt_advance(&gpu_syncpt_max[id], value);
+        gpu_syncpt_advance(&gpu_syncpt_min[id], value);
+        st32(a + 12, gpu_syncpt_read(id));
         return NV_OK;
     }
-    case 0x14: st32(a + 4, gpu_syncpt_min[ld32(a) % SYNCPT_MAX]); return NV_OK;   /* SyncptRead */
+    case 0x14: st32(a + 4, gpu_syncpt_read(ld32(a) % SYNCPT_MAX)); return NV_OK;   /* SyncptRead */
     case 0x1F: case 0x20: case 0x21: case 0x1C: return NV_OK;   /* event register / unregister / kill / clear */
     }
     warn_once("nvhost-ctrl", request);
@@ -310,6 +312,14 @@ static u32 address_space(u32 nr, u64 a, u32 request) {
  * one less) and only one no longer held is reused; queued GPU work may still read what freed handles
  * held, so it runs first, once per batch of them. Nothing changes before the numbers run out. */
 static u32 nvmap_refs[NVMAP_MAX];
+/* (rollback, hle_rb_state.c) The nvmap allocations now, as guest ranges; nv_rb_gen moves when one is made or freed. */
+volatile long nv_rb_gen;
+u32 nv_rb_maps(u64 (*out)[2], u32 max) {
+    u32 n = next_handle < NVMAP_MAX ? next_handle : NVMAP_MAX, k = 0;
+    for (u32 h = 1; h < n && k < max; h++)
+        if (gpu_maps[h].addr && gpu_maps[h].size && nvmap_refs[h]) { out[k][0] = gpu_maps[h].addr; out[k][1] = gpu_maps[h].size; k++; }
+    return k;
+}
 static u32 nvmap_freed[NVMAP_MAX], nvmap_nfreed;   /* freed since the last batch was made reusable */
 static u32 nvmap_spare[NVMAP_MAX], nvmap_nspare;   /* reusable now */
 
@@ -356,10 +366,12 @@ static u32 nvmap(u32 nr, u64 a, u32 request) {
         gpu_maps[h].align = ld32(a + 12);
         gpu_maps[h].kind = ld8(a + 16);
         gpu_maps[h].addr = ld64(a + 24);
+        nv_rb_gen++;
         return NV_OK;
     }
     case 0x05: {                                                          /* Free */
         u32 h = ld32(a);
+        nv_rb_gen++;
         if (!h || h >= NVMAP_MAX) return NV_BAD_PARAMETER;
         st64(a + 8, gpu_maps[h].addr);
         st32(a + 16, (u32)gpu_maps[h].size);
@@ -383,19 +395,18 @@ static u32 nvmap(u32 nr, u64 a, u32 request) {
 
 static u32 submit(u32 fd, u64 a, u64 entries, u32 count) {
     u32 flags = ld32(a + 12), id = files[fd].syncpoint;
-    u32 incr = 0;
-    if (flags & ((1u << 1) | (1u << 8)))   /* increment requested: two for the GPU, plus any extra */
-        incr = 2 + (flags & (1u << 8) ? ld32(a + 20) : 0);
+    /* Bit 1 requests two driver fence increments; bit 8 reserves the increments
+     * already supplied by the command list. A bit-8-only submission adds no two. */
+    u32 incr = (flags & (1u << 1) ? 2u : 0u) + (flags & (1u << 8) ? ld32(a + 20) : 0u);
+    u32 value = gpu_syncpt_add(&gpu_syncpt_max[id], incr);
     if (gpu_threaded()) {   /* run later, on the GPU thread: the sync point reaches the fence then */
-        gpu_syncpt_max[id] += incr;
-        gpu_queue_submit(fd, P(u64, entries), count, id, gpu_syncpt_max[id]);
+        gpu_queue_submit(fd, P(u64, entries), count, id, value);
     } else {
         gpu_submit(fd, P(u64, entries), count);
-        gpu_syncpt_max[id] += incr;
-        gpu_syncpt_min[id] = gpu_syncpt_max[id];   /* everything completes now */
+        gpu_syncpt_advance(&gpu_syncpt_min[id], value);   /* command-list increments already ran */
     }
     st32(a + 16, id);
-    st32(a + 20, gpu_syncpt_max[id]);
+    st32(a + 20, value);   /* the fence of this submission, even if later work advances max */
     return NV_OK;
 }
 
@@ -409,8 +420,10 @@ static u32 channel(u32 fd, u32 group, u32 nr, u64 a, u32 request, u64 in, u64 in
     }
     case 0x1B: return submit(fd, a, in, ld32(a + 8));                     /* SubmitGpfifo, entries inline */
     case 0x1A:                                                            /* AllocGpfifoEx2 */
-        st32(a + 24, files[fd].syncpoint);
-        st32(a + 28, gpu_syncpt_max[files[fd].syncpoint]);
+        /* The 32-byte ABI is {entries, flags, unk0, fence{id,value}, unk1, unk2,
+         * unk3}; returning at +24/+28 left the actual fence zero for every channel. */
+        st32(a + 12, files[fd].syncpoint);
+        st32(a + 16, gpu_syncpt_load(&gpu_syncpt_max[files[fd].syncpoint]));
         return NV_OK;
     }
     if (group == 0x47 && (nr == 0x14 || nr == 0x15)) return NV_OK;           /* client data */
@@ -434,9 +447,9 @@ static u32 host1x(u32 fd, u32 group, u32 nr, u64 a, u32 request) {
         }
         for (u32 i = 0; i < incrs; i++) {
             u32 id = ld32(incr + 20ull * i) % SYNCPT_MAX;
-            gpu_syncpt_max[id] += ld32(incr + 20ull * i + 4);
-            gpu_syncpt_min[id] = gpu_syncpt_max[id];
-            if (i < fences) st32(fence + 4ull * i, gpu_syncpt_max[id]);
+            u32 value = gpu_syncpt_add(&gpu_syncpt_max[id], ld32(incr + 20ull * i + 4));
+            gpu_syncpt_store(&gpu_syncpt_min[id], value);
+            if (i < fences) st32(fence + 4ull * i, value);
         }
         return NV_OK;
     }

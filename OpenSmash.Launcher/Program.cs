@@ -17,6 +17,18 @@ namespace OpenSmash.Launcher
         [STAThread]
         static void Main(string[] args)
         {
+            // Test entry points (ProjectSetup.RunHeadless): no window, no single-instance check.
+            if (ProjectSetup.IsHeadless(args)) { Environment.ExitCode = ProjectSetup.RunHeadless(args); return; }
+
+            // The Play SSBU shortcut: the game straight away once it is built (the launcher waits, hidden, for it).
+            if (args.Contains("--play", StringComparer.OrdinalIgnoreCase) && ProjectSetup.FindProject(AppContext.BaseDirectory) is string built
+                && WindowSmash.IsBuilt(built))
+            {
+                using var game = WindowSmash.StartGame(built);
+                game?.WaitForExit();
+                return;
+            }
+
             ApplicationConfiguration.Initialize();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -28,31 +40,57 @@ namespace OpenSmash.Launcher
             using var mutex = new Mutex(true, "Global\\OpenSmashLauncher", out bool createdNew);
             if (!createdNew) return;
 
-            // Resolve repo root (where the .exe lives or where it was launched from)
-            string repo = AppContext.BaseDirectory;
-            // If running from build output, go up to repo root
-            while (repo.EndsWith("OpenSmash.Launcher", StringComparison.OrdinalIgnoreCase) ||
-                   repo.EndsWith("bin", StringComparison.OrdinalIgnoreCase) ||
-                   repo.EndsWith("Debug", StringComparison.OrdinalIgnoreCase) ||
-                   repo.EndsWith("Release", StringComparison.OrdinalIgnoreCase) ||
-                   repo.EndsWith("publish", StringComparison.OrdinalIgnoreCase))
-            {
-                repo = Path.GetFullPath(Path.Combine(repo, ".."));
-            }
+            // Resolve repo root (where the .exe lives, or the repo above its build output folder)
+            string repo = ProjectSetup.ExeRoot(AppContext.BaseDirectory);
+            UiLocale.Initialize(repo);
 
             // Extract embedded resources (PowerShell scripts, icon) to a temp folder
             string workDir = Path.Combine(Path.GetTempPath(), "OpenSmash_" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(workDir);
             ExtractResources(workDir);
 
+            // On its own (the release's OpenSmash.exe, or OpenSmash.exe anywhere): the folder set up before,
+            // or the first-start screen, which downloads the project and makes the shortcuts. Then the launcher
+            // copied into that folder takes over, so everything starts from there as from a copy of the repo.
+            if (!ProjectSetup.IsProject(repo))
+            {
+                string? found = ProjectSetup.FindProject(AppContext.BaseDirectory);
+                if (found == null)
+                {
+                    using var first = new FirstRunForm(workDir, ProjectSetup.DefaultFolder(repo));
+                    UiLocale.Attach(first);
+                    Application.Run(first);
+                    if (first.Folder == "") return;
+                    found = first.Folder;
+                    string exe = Path.Combine(found, "OpenSmash.exe");
+                    if (File.Exists(exe) && !string.Equals(Path.GetFullPath(exe), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        mutex.ReleaseMutex();
+                        mutex.Dispose();
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo(exe) { WorkingDirectory = found, UseShellExecute = true });
+                            return;
+                        }
+                        catch { }
+                    }
+                }
+                repo = found;
+            }
+
+            UiLocale.Initialize(repo);
+
             // No build yet (or --installer): Install WindowSmash comes first.
             if (!WindowSmash.IsBuilt(repo) || args.Contains("--installer", StringComparer.OrdinalIgnoreCase))
             {
                 using var installer = new InstallerForm(workDir, repo);
+                UiLocale.Attach(installer);
                 Application.Run(installer);
                 if (!installer.Installed || !WindowSmash.IsBuilt(repo)) return;
             }
-            Application.Run(new LauncherForm(workDir, repo, WindowSmash.BuildDir(repo)));
+            using var launcher = new LauncherForm(workDir, repo, WindowSmash.BuildDir(repo));
+            UiLocale.Attach(launcher);
+            Application.Run(launcher);
         }
 
         // ---------------------------------------------------------------------------
@@ -69,7 +107,7 @@ namespace OpenSmash.Launcher
             foreach (string name in asm.GetManifestResourceNames())
             {
                 // The marketplace UI is read straight out of the assembly on demand.
-                if (name.EndsWith(".html", StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.EndsWith(".html", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".js", StringComparison.OrdinalIgnoreCase) || name.StartsWith("Locales.", StringComparison.Ordinal)) continue;
 
                 // Resources carry their file name as the logical name; fall back to
                 // the last two dot-separated segments for the default naming scheme.
@@ -92,7 +130,7 @@ namespace OpenSmash.Launcher
     {
         static readonly string[] ClearedVars =
         {
-            "SSBU_DATA_ROOT", "SSBU_INPUT", "SSBU_NET_HOST", "SSBU_NET_RELAY", "SSBU_NET_BIND",
+            "SSBU_NET_BACKEND", "SSBU_YUZU_PASSWORD", "SSBU_YUZU_TOKEN", "SSBU_DATA_ROOT", "SSBU_INPUT", "SSBU_RENDERER", "SSBU_DISPLAY", "SSBU_NET_HOST", "SSBU_NET_RELAY", "SSBU_NET_BIND",
             "SSBU_NET_ROOM", "SSBU_NET_NAME", "SSBU_NET_DIRECT", "SSBU_NET_PORT"
         };
 
@@ -130,6 +168,9 @@ namespace OpenSmash.Launcher
             string exe = Path.Combine(BuildDir(repo), "ssbu.exe");
             if (!File.Exists(exe)) return null;
             string log = Path.Combine(BuildDir(repo), "play.log");
+            // The last session's log kept as play.prev.log: a player who starts again before sending it still has it
+            // (the settings' Experimental tab, "Open log folder"; docs/adr/0002).
+            try { if (File.Exists(log) && new FileInfo(log).Length > 0) File.Copy(log, Path.Combine(BuildDir(repo), "play.prev.log"), true); } catch { }
             try { File.WriteAllText(log, ""); } catch { }
             var psi = new ProcessStartInfo
             {

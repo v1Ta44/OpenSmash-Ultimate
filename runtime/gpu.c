@@ -28,6 +28,7 @@ typedef struct Engine { u32 cls; u32 regs[0x1000]; u32 i2m_pos; Mme *mme; CbBind
 typedef struct Channel { Engine *sub[8]; u32 fifo[0x40]; } Channel;
 
 static Channel channels[256];
+volatile int gpu_job_hidden;   /* (gpu_queue.c, run-ahead: a submission of a frame never shown: its draws and clears left out) */
 u64 gpu_stat_lists, gpu_stat_batches, gpu_stat_draws, gpu_stat_methods, gpu_stat_dispatches;
 
 static u64 guest(u64 va) {
@@ -39,8 +40,8 @@ static u64 guest(u64 va) {
     return g;
 }
 
-static void write32(u64 va, u32 value) { u64 g = guest(va); if (g) st32(g, value); }
-static void write64(u64 va, u64 value) { u64 g = guest(va); if (g) st64(g, value); }
+static void write32(u64 va, u32 value) { u64 g = guest(va); if (g) { st32(g, value); gpu_rb_wrote(g, 4); } }
+static void write64(u64 va, u64 value) { u64 g = guest(va); if (g) { st64(g, value); gpu_rb_wrote(g, 8); } }
 
 /* The GPU's clock: rt_now_ns, but in a rollback fight (SSBU_RB) the kernel's fixed clock, so that
  * a frame run again reads the same times (kernel.c, "rollback: the fixed clock"). hle_nv.c's
@@ -65,12 +66,13 @@ static void release(u64 va, u32 payload, int four_words) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
     write32(va, payload);
     gfx_guest_wrote(va, four_words ? 16 : 4);
+    gpu_rb_semaphore(gpu_va_to_guest(va));
 }
 
 static void syncpoint_increment(u32 id) {
     if (id < SYNCPT_MAX) {
-        if ((i32)(gpu_syncpt_max[id] - gpu_syncpt_min[id]) <= 0) gpu_syncpt_max[id]++;
-        gpu_syncpt_min[id]++;
+        u32 value = gpu_syncpt_add(&gpu_syncpt_min[id], 1);
+        gpu_syncpt_advance(&gpu_syncpt_max[id], value);
     }
 }
 
@@ -112,6 +114,7 @@ static void i2m_load(Engine *e, u32 base, u32 arg) {   /* the I2M register block
         if (g) {
             u32 n = line - x < 4 ? line - x : 4;
             memcpy(P(void, g), &arg, n);
+            gpu_rb_wrote(g, n);
             gfx_stream_wrote(dst + (u64)y * pitch + x, n);
         }
     }
@@ -162,7 +165,7 @@ static void surface_to_guest(const DmaSurface *src) {
     for (u32 y = 0; y < h; y++)
         for (u32 x = 0; x < w; x++) {
             u64 d = guest(dma_address(&s, x * 4, y));
-            if (d) memcpy(P(void, d), px + ((u64)y * w + x) * 4, 4);
+            if (d) { memcpy(P(void, d), px + ((u64)y * w + x) * 4, 4); gpu_rb_wrote(d, 4); }
         }
     free(px);
     if (told++ < 8) fprintf(stderr, "[gpu] copy engine: read the GPU's %ux%u picture at %#llx back first\n", w, h, g);
@@ -201,7 +204,7 @@ static void dma_launch(Engine *e, u32 arg) {
                 u64 sv = src.base + (u64)y * src.pitch, dv = dst.base + (u64)y * dst.pitch;
                 if (gfx_copy_resident(dv, sv, (u64)line * src_bpe)) continue;
                 u64 s = guest(sv), d = guest(dv);
-                if (s && d) memmove(P(void, d), P(void, s), (size_t)line * src_bpe);
+                if (s && d) { memmove(P(void, d), P(void, s), (size_t)line * src_bpe); gpu_rb_wrote(d, (u64)line * src_bpe); }
                 gfx_resident_written(dv, (u64)line * src_bpe);
             }
         } else if (identity) {
@@ -214,7 +217,7 @@ static void dma_launch(Engine *e, u32 arg) {
                     if (!dst.pitch_linear && 16 - ((x + dst.ox) % 16) < n) n = 16 - ((x + dst.ox) % 16);
                     if (n > bytes - x) n = bytes - x;
                     u64 s = guest(dma_address(&src, x, y)), d = guest(dma_address(&dst, x, y));
-                    if (s && d) memcpy(P(void, d), P(void, s), n);
+                    if (s && d) { memcpy(P(void, d), P(void, s), n); gpu_rb_wrote(d, n); }
                     x += n;
                 }
         } else {   /* remapped components, constants included: element by element */
@@ -235,6 +238,7 @@ static void dma_launch(Engine *e, u32 arg) {
                         else if (sel == 5) memcpy(out + k * csize, &e->regs[0x1C1], csize);
                     }
                     memcpy(P(void, d), out, dst_bpe);
+                    gpu_rb_wrote(d, dst_bpe);
                 }
         }
         if (dst_span && !(src.pitch_linear && identity)) gfx_resident_written(dst.base, dst_span);   /* (the plain case did it per line) */
@@ -361,7 +365,16 @@ static void engine_method(Channel *ch, Engine *e, u32 method, u32 arg) {
             else if (op == 2) release(va, 0, !one_word);   /* counters read as zero until rendering exists */
             break;
         }
-        case 0x0B2: if (arg & (1u << 16)) syncpoint_increment(arg & 0xFFFF); break;   /* SYNCPOINT_ACTION */
+        case 0x0B2: {   /* NVB197_INCREMENT_SYNC_POINT (0x02c8 / 4) */
+            /* NVIDIA clb197.h: index 11:0; bit 16 cleans L2, bit 20 selects
+             * stream-out/ROP completion. Both conditions increment, with or
+             * without a cache clean. Earlier draws have reached the backend. */
+            u32 id = arg & 0xFFF;
+
+            syncpoint_increment(id);
+
+            break;
+        }
         case 0x06C: e->i2m_pos = 0; break;                                            /* I2M launch */
         case 0x06D: i2m_load(e, 0x60, arg); break;                                    /* I2M data */
         case M_CB_BIND(0): case M_CB_BIND(1): case M_CB_BIND(2): case M_CB_BIND(3): case M_CB_BIND(4): {
@@ -380,10 +393,10 @@ static void engine_method(Channel *ch, Engine *e, u32 method, u32 arg) {
             e->regs[0x8E3] += 4;
             break;
         }
-        case 0x585: gpu_stat_draws++; gfx_draw(e->regs, e->cb, e->indexed); break;
+        case 0x585: gpu_stat_draws++; if (!gpu_job_hidden) gfx_draw(e->regs, e->cb, e->indexed); break;
         case M_DRAW_INDEX_COUNT: e->indexed = 1; break;                                /* indexed draw follows */
         case M_VERTEX_ARRAY_COUNT: e->indexed = 0; break;
-        case 0x674: gfx_clear(e->regs, arg); break;                                  /* clear surface */
+        case 0x674: if (!gpu_job_hidden) gfx_clear(e->regs, arg); break;             /* clear surface */
         }
         break;
     case CLASS_COMPUTE:

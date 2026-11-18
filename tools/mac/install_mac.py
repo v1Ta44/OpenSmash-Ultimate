@@ -81,7 +81,8 @@ LAUNCHERS = ["Install WindowSmash.command", "Play SSBU.command", "launchers/Play
              "launchers/Host SSBU Netplay.command", "launchers/Join SSBU Netplay.command",
              "launchers/Unlock All Fighters.command", "launchers/Build WindowSmash.command",
              "Mods.command", "launchers/WindowSmash Mods.command", "launchers/Uninstall WindowSmash Mods.command",
-             "launchers/Import Miis.command", "tools/mac/launch.sh"]
+             "launchers/Import Miis.command", "OpenSmash Launcher.command", "tools/mac/launch.sh",
+             "tools/mac/rebuild-all.command"]
 EMULATORS = ("yuzu", "eden", "sudachi", "citron", "suyu", "torzu")   # yuzu and the forks with its layout
 SSBU_TITLES = "01006a800016"   # (Super Smash Bros. Ultimate's title ids: the game's, its update's and DLC's)
 NAME_MAX = 32   # (as the Windows setup window's box)
@@ -779,9 +780,14 @@ def check_tools():
     game is (C++ exceptions through C, SDL3, Metal), and run."""
     r = subprocess.run([venv_python(), os.path.join(ROOT, "tools", "build_game.py"), "--check"], cwd=ROOT,
                        capture_output=True, text=True)
-    said = [line.strip() for line in (r.stdout + r.stderr).splitlines() if line.strip()]
+    lines = (r.stdout + r.stderr).splitlines()
+    said = [line.strip() for line in lines if line.strip()]
     if r.returncode:
-        problem = next((line[len("ERROR: "):] for line in said if line.startswith("ERROR: ")), said[-1] if said else "")
+        at = next((i for i, line in enumerate(lines) if line.startswith("ERROR: ")), None)
+        if at is None:
+            problem = said[-1] if said else ""
+        else:   # (with what follows it: the compiler's own words, which its message says are below)
+            problem = "\n".join(line.rstrip() for line in lines[at:]).strip()[len("ERROR: "):]
         raise Stop("The tools cannot build the game yet: " + problem)
     for line in said:   # (not its heading, nor the Python step 4 named)
         if not line.startswith(("[", "Python ")) and line != "The tools are ready.":
@@ -1227,6 +1233,7 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the memory)")
     ap.add_argument("--skip-build", action="store_true", help="everything but compiling the game")
     ap.add_argument("--no-update", action="store_true", help="don't look for a newer WindowSmash")
+    ap.add_argument("--update-only", action="store_true", help="only get the newest WindowSmash (the launcher's Update)")
     ap.add_argument("--no-wizard", action="store_true", help="ask in this window instead of in dialogs")
     ap.add_argument("--yes", action="store_true", help="take the folders found or given, without asking")
     ap.add_argument("--dry-run", action="store_true", help="say what each step would do, do nothing")
@@ -1242,6 +1249,9 @@ def main(argv=None):
             args = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--no-update"]
             os.execv(sys.executable, [sys.executable, "-u", os.path.join(ROOT, "tools", "mac", "install_mac.py"),
                                       *args, "--no-update"])
+        if a.update_only:
+            print("Update done." if not a.dry_run else "")
+            return 0
         step_check_mac()
         step_tools(a)
         step_python(a)

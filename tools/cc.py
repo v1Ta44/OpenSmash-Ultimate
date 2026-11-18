@@ -12,7 +12,10 @@ import ladder
 import progress
 from ladder import CRASH_SIGNS, RETRY, crash_cause, crash_report, crashed  # noqa: F401 (the crash retry's, here before)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The folder as Windows spells it on disk (realpath there): the compile commands name it (runtime/, deps/), and
+# objcache.py keys each object on its command, so a build started from a folder typed in other capitals
+# (C:\users\... for C:\Users\..., as a WSL shell or a typed cd gives) compiled the whole game again.
+ROOT = os.path.dirname(os.path.dirname((os.path.realpath if os.name == "nt" else os.path.abspath)(__file__)))
 RUNTIME = os.path.join(ROOT, "runtime")
 DEPS_LLVM = os.path.join(ROOT, "deps", "llvm")   # tools/msvc_deps.py sets these two up
 DEPS_MSVC = os.path.join(ROOT, "deps", "msvc")
@@ -31,8 +34,9 @@ def _find_toolchain():
     """(clang-cl, the /winsysroot folder or None, which toolchain that is, in words):
     SSBU_CLANG if set; else deps\\llvm's with deps\\msvc as the system root, when tools/msvc_deps.py
     has set both up (no Visual Studio needed); else Visual Studio's own (the "C++ Clang tools"
-    component), newest edition first, else a standalone LLVM install, else whatever is on PATH.
-    The last three find the C runtime and the Windows SDK themselves, through Visual Studio."""
+    component), newest edition first; else deps\\llvm with Visual Studio's installed C runtime
+    and SDK; else a standalone LLVM install, else whatever is on PATH. Without deps\\msvc,
+    clang-cl finds the system C runtime and Windows SDK through Visual Studio."""
     if os.environ.get("SSBU_CLANG"):
         return os.environ["SSBU_CLANG"], None, "SSBU_CLANG"
     llvm, msvc = _deps_record(DEPS_LLVM), _deps_record(DEPS_MSVC)
@@ -48,6 +52,19 @@ def _find_toolchain():
                        key=vs_major, reverse=True)
         if found:
             return found[0], None, "Visual Studio's C++ Clang tools"
+    # LLVM and the MSVC/SDK packages can be installed independently. A PC with
+    # Visual Studio's C++ runtime but no VS Clang component can use our bundled
+    # compiler without a deps\msvc record (as an SSBU_CLANG override already can).
+    bundled_clang = os.path.join(DEPS_LLVM, "bin", "clang-cl.exe")
+    roots = (os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    if os.path.isfile(bundled_clang):
+        crt = any(glob.glob(os.path.join(root, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "MSVC", "*", "lib", "x64", "libcmt.lib"))
+                  for root in roots)
+        sdk = any(glob.glob(os.path.join(root, "Windows Kits", "10", "Lib", "*", "um", "x64", "kernel32.lib"))
+                  for root in roots)
+        if crt and sdk:
+            return bundled_clang, None, "deps\\llvm with Visual Studio's C++ runtime and Windows SDK"
     for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),):
         for clang in glob.glob(os.path.join(root, "LLVM", "bin", "clang-cl.exe")):
             return clang, None, "LLVM's installer (Program Files), with Visual Studio's C runtime and Windows SDK"
@@ -68,7 +85,7 @@ def base_cflags(target):
 
 
 BASE_CFLAGS = base_cflags(ISA)
-CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
+CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME, "/I", os.path.join(ROOT, "third_party", "enet", "include")]
 # runtime/cpu_check.c's: for any x64 processor, as it checks the processor before anything else runs
 CHECK_CFLAGS = [*base_cflags(isa.ANY), "/I", RUNTIME]
 # The generated C's flags: it includes recomp.h or module.h, which read none of the runtime's defines and
@@ -178,7 +195,7 @@ def compile_command(src, obj, opt, flags=None, header=None):
 
 
 def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, compiled=None, flags=None, shown=None,
-                 infos=None, steps=None, times=None):
+                 infos=None, steps=None, times=None, failed=None, skip=None):
     """Compile (src, obj, opt) triples in parallel, in order, with flags (CFLAGS unless given); returns
     [(src, error text)] for failures. started(job) and finished(job, seconds), if given, are called
     (from the worker threads) as each one starts and ends (shown: a progress.Build, which also hears
@@ -186,10 +203,10 @@ def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, com
     it compiled at. A file the compiler crashed on is compiled again once the others are done, on its
     own (RETRY); log() says so. infos {obj: ladder.Info}: the generated files, which have a time limit
     and the rest of the ladder (steps: the build's ladder.Ladder, else one of its own); times: the
-    build folder's ladder.Times."""
+    build folder's ladder.Times. failed(job) and skip(job): ladder.Ladder.compile's."""
     steps = steps or ladder.Ladder(progress.level_cost, "clang-cl", log)
     return steps.compile(jobs_list, jobs, lambda job, level, header: compile_command(job[0], job[1], level, flags, header),
-                         infos, shown, started, finished, compiled, times)
+                         infos, shown, started, finished, compiled, times, failed, skip)
 
 
 def link_command(rsp, exe, options=(), libs=()):

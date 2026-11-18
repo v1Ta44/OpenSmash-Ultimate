@@ -1326,6 +1326,9 @@ static void enqueue(Job *j, int q, int front) {
 static void enqueue_shader(Shader *s) { enqueue(&s->job, s->cached ? 0 : 1, s->cached && s->stage == SHADER_COMPUTE); }
 
 void gfx_status_lines(void) {}   /* (no lines of its own yet) */
+void gfx_match_want(unsigned long long key, int first) { (void)key; (void)first; }   /* (the Vulkan warm start's groups: none here) */
+void gfx_match_wait(void) {}
+void gfx_warm_hint(unsigned long long key, int pick) { (void)key; (void)pick; }
 int gfx_present_again(void) { return 0; }   /* (no frame shown again here: the software keyboard keeps its dialog) */
 void gfx_closing(void) {}   /* (no shaders to warm at the next start: Metal keeps its own cache) */
 
@@ -3422,7 +3425,10 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     /* The fixed-function alpha test (ui2d's alpha compare: the main menu's stencil masks are cut
      * from a texture's alpha this way) needs the pixel shader's variant that discards; while that
      * compiles, the plain one draws as before. */
-    MTLCompareFunction alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : MTLCompareFunctionAlways;
+    /* alpha to coverage on targets of one sample: the alpha test >= 0.5 (gpu_d3d11.c) */
+    int a2c = (regs[M_ANTI_ALIAS_ALPHA_CONTROL] & 1) && !(regs[M_ALPHA_TEST] & 1) && !(gfx_debug() & 64);
+    MTLCompareFunction alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC])
+                                  : a2c ? MTLCompareFunctionGreaterEqual : MTLCompareFunctionAlways;
     Shader *pa_e = alpha_func != MTLCompareFunctionAlways && ps_e && state_of(&ps_e->state) != 2 && (ps_e->info.color_mask & 1)
                  ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 1) : NULL;
     Shader *vs = vs_e && state_of(&vs_e->state) == 1 ? vs_e : NULL;
@@ -3485,7 +3491,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.frag[1] = (float)rt_h;
     /* (the variant's passing outcomes, alpha_test_mask's of a D3D11_COMPARISON_FUNC: Metal's
      * MTLCompareFunction is that less one) */
-    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask((u32)alpha_func + 1)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask((u32)alpha_func + 1)); params.frag[3] = a2c ? 0.5f : f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * Metal judges the winding as seen on the target, as Direct3D does: after the fix-up above that

@@ -16,12 +16,17 @@
  *                          and a "peer ..." line each
  *   open WHO PLAYERS       rbl_open_relay: WHO auto, 0-3 or -1: "open 1" (or 0)
  *   number SECS            (open auto) wait for this game's number from the room's order: "number P" (-1: none)
+ *   online P PEER          SSBU_RB_NET=online: the link opened with no number, then an Online match's set-up gives it
+ *                          (rbl_relay_online: this game player P, the other at address PEER): "online OK NUMBER"
+ *   offline                the Online match over (rbl_relay_online_end): "offline NUMBER" (-1)
+ *   note IP / recent MS    net_note_peer (as hle_net.c for each datagram sent) / net_recent_peers: "recent N IP..."
  *   hello SECS             the handshake: "hello OK PLAYER" or "hello FAIL ..."
  *   pads N SECS            PADS for frames 1..N both ways (two players): "pads OK GOT BAD" or "pads FAIL ..."
  *   stats                  "stats OUT_DATA OUT_LOBBY IN_DIRECT IN_RELAYED IN_LOBBY SENT RECEIVED DROPPED"
  *   quit                   ends (net_relay.c's exit handler sends LEAVE)
  * Anything else: "error". */
 #include "../../runtime/net_relay.c"
+#include "../../runtime/net_eos.c"
 #include "../../runtime/hle_rb_link.h"
 #include "../../runtime/hle_rb_net.h"
 
@@ -37,6 +42,13 @@ static char build_text[BUILD_LEN + 1];
 const char *rt_data_dir = ".";
 int rt_code_patches_on(void) { const char *e = getenv("SSBU_CODE_PATCHES"); return e && *e == '1'; }   /* (hle_mod_switch.c: SSBU_CODE_PATCHES here) */
 const RtModule rt_module_main = {.build_id = build_text};
+/* (net_eos_net.c, net_eos_lobby.c and the NEX server's: the EOS hub alone, the game's NEX over EOS; never reached here) */
+const struct NetBackend net_eos_backend;
+void net_eos_net_packet(const char *from, const u8 *p, u32 n) { (void)from; (void)p; (void)n; }
+void nexeos_tick(void) {}
+void nexeos_packet(const char *from, const u8 *data, u32 len) { (void)from; (void)data; (void)len; }
+int nexeos_lobbies(char ids[][16], int max) { (void)ids; (void)max; return 0; }
+uint64_t nex_pid_of(const char *key) { (void)key; return 0; }
 int settings_online(void) { return 0; }
 int settings_line_read(const char *path, char *out, int size) { (void)path; (void)out; (void)size; return 0; }
 int settings_line_write(const char *path, const char *line) { (void)path; (void)line; return 0; }
@@ -227,6 +239,27 @@ int main(void) {
             int ok = rbl_open_relay(is_auto ? RBL_AUTO : me, nplayers);
             if (ok && me == 0) rbl_players(nplayers);
             say("open %d", ok);
+        } else if (!strcmp(what, "online") && sscanf(line, "online %d %u", &a, &u1) == 2) {
+            /* (SSBU_RB_NET=online: the link opened with no number; an Online match's set-up gives this game's player and
+             * the other's address, as hle_rb_core.c's online_setup does from the game's records and net_recent_peers) */
+            nplayers = 2; is_auto = 0;
+            int ok = rbl_open_relay(RBL_ONLINE, nplayers), before = rbl_relay_number();
+            u32 ips[8] = {0};
+            ips[1 - a] = u1;
+            ok = ok && before == -1 && rbl_relay_online(a, nplayers, ips);
+            if (ok) { me = a; if (a == 0) rbl_players(nplayers); }
+            say("online %d %d", ok, rbl_relay_number());
+        } else if (!strcmp(what, "offline")) {
+            rbl_relay_online_end();
+            say("offline %d", rbl_relay_number());
+        } else if (!strcmp(what, "note") && sscanf(line, "note %u", &u1) == 1) { net_note_peer(u1); say("ok"); }
+        else if (!strcmp(what, "recent") && sscanf(line, "recent %u", &u1) == 1) {
+            u32 r[8];
+            int n = net_recent_peers(r, 8, u1);
+            char t[160] = "";
+            size_t k = 0;
+            for (int i = 0; i < n; i++) k += (size_t)snprintf(t + k, sizeof t - k, " %u", r[i]);
+            say("recent %d%s", n, t);
         } else if (!strcmp(what, "number") && sscanf(line, "number %lf", &secs) == 1) {
             u64 end = deadline(secs);
             int p = -1;

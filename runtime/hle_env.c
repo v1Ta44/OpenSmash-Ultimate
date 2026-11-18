@@ -34,15 +34,18 @@ HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) { c->x[0] = 0; }       /* no messag
 /* The game's language: SSBU_LANGUAGE, else display.ini's language (the settings menu writes it;
  * auto or missing: the system's), else the system's display language - Windows' user interface
  * language (not its regional format), or LANG / LC_ALL elsewhere. Asked once; logged once. */
-static u64 desired_language(void) {
-    static u64 code;
-    if (code) return code;
+static u64 desired_code;
+static const char *chosen_language;   /* the pick when SSBU_LANGUAGE or display.ini named a language the game has */
+static BOOL CALLBACK find_language(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
     char name[96] = "", from[32] = "SSBU_LANGUAGE";
     const char *env = getenv("SSBU_LANGUAGE");
-    if (env && *env) snprintf(name, sizeof name, "%s", env);
+    int chosen = 1;
+    if (env && *env && _stricmp(env, "auto")) snprintf(name, sizeof name, "%s", env);
     else if (settings_ini_get(display_ini_path(), NULL, "language", name, sizeof name) && name[0] && _stricmp(name, "auto"))
         snprintf(from, sizeof from, "display.ini");
     else {
+        chosen = 0;
         name[0] = 0;
         snprintf(from, sizeof from, "the system");
 #ifdef _WIN32
@@ -60,8 +63,23 @@ static u64 desired_language(void) {
     u64 v = 0;
     memcpy(&v, pick, strlen(pick));
     fprintf(stderr, "[env] the game's language: %s (from %s, \"%s\")\n", pick, from, name);
-    code = v;
-    return v;
+    if (chosen && language_known(name)) chosen_language = pick;   /* (a typo is not a choice: the save keeps its own) */
+    desired_code = v;
+    return TRUE;
+}
+/* (asked by the game's thread and by the save's reader: worked out once, InitOnce) */
+static u64 desired_language(void) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, find_language, NULL, NULL);
+    return desired_code;
+}
+/* (hle_fs.c) The text language the game's system save should hold: the one the player chose
+ * (SSBU_LANGUAGE, or display.ini's language when it is not auto), as the save keeps it
+ * (language.h); -1 when none was chosen, and the save's own stays (as on the console). */
+int save_language_wanted(const char **code) {
+    desired_language();
+    if (code) *code = chosen_language;
+    return chosen_language ? language_save_value(chosen_language) : -1;
 }
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) { c->x[0] = desired_language(); }   /* a LanguageCode, by value */
 HLE(_ZN2nn2oe25GetProgramTotalActiveTimeEv) { c->x[0] = rt_now_ns(); }
@@ -260,6 +278,13 @@ HLE(_ZN2nn7account16LoadProfileImageEPmPvmRKNS0_3UidE) { st64(c->x[0], 0); c->x[
  * configured the user has one, named by the netplay id, and its id token - which only the NEX
  * server of tools/nex reads - carries that id and the player's name. Offline there is none. */
 static u64 nsa_id(void) { u64 id = USER[0] ^ USER[1]; return id ? id : 1; }
+/* (net_discord.c: the key of its signed requests to the lobby's GSP pages, tools/nex/board.py) the NSA id as the token
+ * writes it; 0 offline */
+int account_nsa_hex(char out[17]) {
+    if (!net_configured()) { out[0] = 0; return 0; }
+    snprintf(out, 17, "%016llx", (unsigned long long)nsa_id());
+    return 1;
+}
 HLE(_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE) { st8(c->x[0], net_configured() != 0); c->x[0] = 0; }
 HLE(_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE) { c->x[0] = net_configured() ? 0 : R_UNAVAILABLE; }
 HLE(_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE) {
@@ -355,7 +380,18 @@ HLE(_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_) { memcpy(P(void, c->x[0]), P(void, c-
  * and at most 3 a run: a game that keeps failing (a network gone) is not a wall of boxes. */
 void watchdog_pause(int on);   /* debug_watchdog.c */
 void *gfx_window_handle(void);
+void menu_toast(const char *text);   /* gpu_menu.h */
 static void error_dialog(u32 category, u32 number) {
+    /* (2306: the game's online service - most often its login at the start, when the lobby's game server does not
+     * answer. Players saw "Error Code: 2306-0103" as a box over the game at every start while offline play went on
+     * fine (#195, a player's report 2026-11-11): a message at the bottom of the picture instead, the game not held.) */
+    if (category == 2306) {
+        char t[160];
+        snprintf(t, sizeof t, "Online: the game server didn't answer (error %04u-%04u). Offline play works; online, check online_server.txt.",
+                 category, number);
+        menu_toast(t);
+        return;
+    }
 #ifdef _WIN32
     static LONG shown;
     const char *off = getenv("SSBU_ERROR_DIALOG"), *headless = getenv("SSBU_HEADLESS");

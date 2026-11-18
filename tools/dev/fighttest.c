@@ -63,6 +63,12 @@ static void test_steps(void) {
         long got = fight_steps(&s, POLLS[i].frame, POLLS[i].on);
         CHECK(got == POLLS[i].want, "poll %u (frame %lld, ready-go %d): %ld ticks, wanted %ld", i + 1, POLLS[i].frame, POLLS[i].on, got, POLLS[i].want);
     }
+    FightSteps u = {0};   /* paused: the fight frame still with ready-go on: after FIGHT_PAUSE_POLLS polls, one a poll */
+    fight_steps(&u, 9, 1);
+    long sum = 0;
+    for (int i = 0; i < FIGHT_PAUSE_POLLS + 5; i++) sum += fight_steps(&u, 9, 1);
+    CHECK(sum == 5, "paused for %d polls: %ld ticks, wanted 5", FIGHT_PAUSE_POLLS + 5, sum);
+    CHECK(fight_steps(&u, 10, 1) == 1, "unpaused: fight frames again");
     FightSteps t = {0};
     fight_steps(&t, -2, 0);   /* (before any fight: a lower count is no tick, counted as 0) */
     CHECK(t.hist[0] == 1, "a poll with no new frame is counted");
@@ -149,6 +155,26 @@ static void test_player(void) {
     fight_put32(none + 0x78, 3);
     dm_player(&col, 0, none, 3, NULL);
     CHECK(none[0x90] == 0 && get64(none + 0x88) == 0, "a player with no panel: no colour either");
+    DebugMatch tag;   /* tag1..tag4: a player's name tag (#152) */
+    dm_init(&tag);
+    dm_parse(&tag, "tag1=1,tag2=0,tag3=99");
+    CHECK(tag.tag[0] == 1 && tag.tag[1] == 0 && tag.tag[2] == 0 && tag.tag[3] == -1, "tag1..tag4 parsed, out of the list: none, tag4 not set");
+    uint8_t panel[DM_PANEL];
+    memset(panel, 0, sizeof panel);
+    fight_put32(panel + 0x214, 7);
+    dm_player(&tag, 0, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 1 && panel[0x450] == 1, "player 1: tag 1 (slot + 1), a human's panel");
+    dm_player(&tag, 1, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 0 && panel[0x450] == 1, "player 2: no tag, the panel flag left as it was");
+    panel[0x450] = 0; fight_put32(panel + 0x78, 1);
+    dm_player(&tag, 0, panel, 1, NULL);
+    CHECK(fight_get32(panel + 0x214) == 1 && panel[0x450] == 0, "a CPU's panel: the tag, but no human flag");
+    fight_put32(panel + 0x78, 0);
+    fight_put32(panel + 0x214, 5);
+    dm_player(&tag, 3, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 5, "player 4: tag not set, left alone");
+    dm_player(&tag, 0, panel, 3, NULL);
+    CHECK(fight_get32(panel + 0x214) == 5, "a player with no panel: no tag either");
 }
 
 static void test_stage(void) {

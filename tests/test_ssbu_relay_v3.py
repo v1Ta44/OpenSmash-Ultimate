@@ -123,7 +123,7 @@ class V3Player:
         pong = self.first(R.PONG)
         if pong is None:
             return None
-        assert len(pong) == 21 and pong[4:12] == struct.pack(">Q", 1234), pong.hex()
+        assert len(pong) == (29 if self.ext else 21) and pong[4:12] == struct.pack(">Q", 1234), pong.hex()   # (29: and 'N' 'A')
         return struct.unpack_from(">HHBHH", pong, 12)
 
     def leave(self):
@@ -421,7 +421,10 @@ class RoomBrowser(V3Test):
 
     def test_more_than_a_list(self):
         """More rooms than the game's Rooms List holds (24): a page at a time, the picked one first, every one in ROOMS."""
-        self.server.lobby.o.listed_for = 60.0   # (29 rooms take a while to open: none goes stale meanwhile)
+        # (Creating 29 rooms can outlast the default host and listing timeouts on a loaded CI runner.)
+        self.server.lobby.o.client_timeout = 60.0
+        self.server.lobby.o.listing_timeout = 60.0
+        self.server.lobby.o.listed_for = 60.0
         hosts = []
         for i in range(29):
             h, _, _ = self.room(mod_set=self.mine)
@@ -636,6 +639,9 @@ class Rules(V3Test):
             doc = json.loads(r.read())
         self.assertEqual(doc["players"], 1)
         self.assertIn(f"SN {R.PROTOCOL} and {R.V3}", doc["version"])
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/badge.json", timeout=3) as r:
+            badge = json.loads(r.read())
+        self.assertEqual((badge["schemaVersion"], badge["label"], badge["message"], badge["color"]), (1, "players online", "1", "brightgreen"))
 
 
 class OnlineLobby(unittest.TestCase):

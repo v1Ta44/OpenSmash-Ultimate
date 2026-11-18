@@ -3,7 +3,8 @@
  * nothing of this file runs and no hook is installed. Contains nothing of the game.
  *
  * 1. The registry. <folder>\<name>\fighter.json of every sub-folder = one new fighter (name, donor, dll,
- *    kind). Kinds are given in name order from 0x5E. A fighter's script library is
+ *    kind). Kinds are given in name order from 0x5E; past the 16th the kind component shares the 16 kind
+ *    numbers per match (it rewrites the kind of each row as it binds them). A fighter's script library is
  *    SSBU_FIGHTER_BIN\<name>.dll when that folder has one, else <folder>\<name>\<dll>. SSBU_MODS defaults
  *    to registry_bin\ beside the program: the registry's components (the kind and roster DLLs, built with
  *    hook.h, loaded by hle_native_mods.c), which get the list through the exported ssbu_registry()
@@ -90,7 +91,8 @@ typedef struct SsbuRegistry {
  * the worker f_71022b6620 sets x4 = request + 0x30, calls f_7101ea04d0 with x30 = 0x71022b67d4, then writes
  * request + 0x132; it reads the archive's tables at 0x7105332000 + 0xf20. */
 #define MAIN 0x7100000000ull
-#define NM_MAX 16   /* = the spare rows of the engine's kind tables (0x5E-0x6D; 0x6E.. are special kinds) */
+#define NM_MAX 128  /* fighters; the engine's kind tables have 16 spare rows (0x5E-0x6D; 0x6E.. are special kinds), which
+                     * the kind component shares per match (a match has at most 8 fighters): see SsbuRegFighter.kind */
 #define NM_VT_SLOTS 96
 #define NM_WORKER_RET (MAIN + 0x22b67d4)        /* 13.0.5 = 13.0.4 (lifted: f_71022b6620) */
 #define NM_FORMATTER (MAIN + 0x1ea04d0)
@@ -164,12 +166,28 @@ static int nm_json_str(const char *js, const char *key, char *out, size_t n) {
 static int nm_cmp_fighter(const void *a, const void *b) { return strcmp(((const NewMod *)a)->f.name, ((const NewMod *)b)->f.name); }
 static int nm_exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
 
+/* The fighter kinds main's code has room for: tools/recomp.py link writes it (kind_room.c, from the patches main was
+ * lifted with: tools/fighter_kinds.py room); -1 in a program linked some other way. A main without the room
+ * (0x5E: the game's own) aborts the set-up of a fighter of kind 0x5E.. (its `kind < 0x5E` checks, e.g. the fighter
+ * init 0x71006867e0: svcBreak from abort), and the kind component's rows of array B, written at +0x19A8 of the
+ * parameter object, fall past the end of the game's 0x19A8-byte one: heap corruption that stops even a match of
+ * the game's own fighters, wherever the heap's layout puts something there. */
+extern const int rt_main_kind_room;
+const int rt_main_kind_room_unknown = -1;
+#pragma comment(linker, "/alternatename:rt_main_kind_room=rt_main_kind_room_unknown")
+
 /* (hle_native_mods.c, before it reads SSBU_MODS; and ssbu_registry()) */
 void fighter_registry_scan(void) {
     static LONG done;
     if (InterlockedExchange(&done, 1)) return;
     const char *root = getenv("SSBU_CHARACTERS");
     if (!root || !root[0]) return;
+    if (rt_main_kind_room >= 0 && rt_main_kind_room <= 0x5e) {
+        nm_log("[registry] SSBU_CHARACTERS=%s: NO NEW FIGHTER: this program's main was built without room for new fighter kinds "
+               "(it has 0x%x); make it with `python tools/fighter_kinds.py` (dump/patches/main.txt) and build the game again", root,
+               rt_main_kind_room);
+        return;
+    }
     char pat[MAX_PATH * 2];
     WIN32_FIND_DATAA fd;
     snprintf(pat, sizeof pat, "%s\\*", root);
@@ -204,7 +222,8 @@ void fighter_registry_scan(void) {
     const char *bin = getenv("SSBU_FIGHTER_BIN");
     for (int i = 0; i < g_nm_count; i++) {
         NewMod *nm = &g_nm[i];
-        if (nm->f.kind < 0) nm->f.kind = 0x5e + i;   /* "auto": the first free kind numbers, in name order */
+        if (nm->f.kind < 0 && i < 16) nm->f.kind = 0x5e + i;   /* "auto": the first free kind numbers, in name order; the 17th on
+                                                                 * get one per match from the kind component (n12_kind) */
         nm->dll_path[0] = 0;
         if (bin && bin[0]) {
             snprintf(nm->dll_path, sizeof nm->dll_path, "%s\\%s.dll", bin, nm->f.name);
@@ -227,7 +246,8 @@ void fighter_registry_scan(void) {
             snprintf(exe + n, sizeof exe - n, "registry_bin");
             _putenv_s("SSBU_MODS", exe);
         }
-        nm_log("[registry] %d new fighter(s) from %s; components from %s", g_nm_count, root, getenv("SSBU_MODS"));
+        nm_log("[registry] %d new fighter(s) from %s; components from %s; main's kinds: 0x%x%s", g_nm_count, root, getenv("SSBU_MODS"),
+               rt_main_kind_room, rt_main_kind_room < 0 ? " (not known: linked other than by tools/recomp.py link)" : "");
     } else nm_log("[registry] SSBU_CHARACTERS=%s: no sub-folder with a fighter.json: no new fighter", root);
 }
 
@@ -569,8 +589,10 @@ static char *nm_stristr(char *s, const char *name) {
     for (; *s; s++) if (!_strnicmp(s, name, n)) return s;
     return NULL;
 }
+int rb_page_cold(const void *p);   /* (hle_rb_state.c: read-only for the rollback state map, writable all the same) */
 static int nm_writable(void *p) {
     MEMORY_BASIC_INFORMATION mi;
+    if (rb_page_cold(p)) return 1;
     return VirtualQuery(p, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_READONLY | PAGE_EXECUTE_READ));
 }
 /* A colour of a new fighter its data does not have: the path of another costume slot (a whole token c01..c07,
